@@ -7,6 +7,9 @@ from threading import Lock
 import logging
 import uuid
 from collections import deque
+import json
+import gzip
+import base64
 
 # Configure logging
 logging.basicConfig(
@@ -16,7 +19,7 @@ logging.basicConfig(
 logger = logging.getLogger('paintblast')
 
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', ping_interval=25, ping_timeout=60)
 
 # Game state
 game_state = {
@@ -39,6 +42,14 @@ server_status = {
     'blueTeamPlayers': 0
 }
 
+# Performance optimization settings
+POSITION_UPDATE_THRESHOLD = 0.5  # Minimum position change to trigger update
+ROTATION_UPDATE_THRESHOLD = 0.1  # Minimum rotation change to trigger update
+BROADCAST_RATE_LIMIT = 100  # Milliseconds between broadcast updates
+PLAYER_UPDATE_BATCH_SIZE = 20  # Send player updates in batches
+ENABLE_COMPRESSION = True  # Enable message compression for large payloads
+COMPRESSION_THRESHOLD = 1024  # Only compress messages larger than 1KB
+
 # Game constants
 PLAYER_RADIUS = 1.0
 PAINTBALL_RADIUS = 0.2
@@ -54,9 +65,59 @@ MAX_PLAYERS_PER_TEAM = 50  # To ensure team balance
 # Thread safety
 game_state_lock = Lock()
 
+# Performance tracking
+last_broadcast_time = time.time()
+server_stats = {
+    'messages_received': 0,
+    'messages_sent': 0,
+    'bytes_received': 0,
+    'bytes_sent': 0,
+    'position_updates': 0,
+    'start_time': time.time()
+}
+
+def compress_data(data):
+    """Compress data if it exceeds threshold."""
+    if not ENABLE_COMPRESSION:
+        return data, False
+    
+    # Serialize data to JSON
+    json_data = json.dumps(data)
+    
+    # Check if compression is worth it
+    if len(json_data) < COMPRESSION_THRESHOLD:
+        return data, False
+    
+    # Compress
+    compressed = gzip.compress(json_data.encode())
+    encoded = base64.b64encode(compressed).decode()
+    
+    return encoded, True
+
 def broadcast_game_state():
     """Broadcast the current game state to all clients."""
-    socketio.emit('gameState', game_state)
+    global last_broadcast_time
+    
+    # Rate limit broadcasts
+    now = time.time()
+    if now - last_broadcast_time < BROADCAST_RATE_LIMIT / 1000:
+        return
+    
+    last_broadcast_time = now
+    
+    # Compress if large
+    compressed_data, is_compressed = compress_data(game_state)
+    
+    if is_compressed:
+        socketio.emit('gameStateCompressed', compressed_data)
+        # Track compressed data size
+        server_stats['bytes_sent'] += len(compressed_data)
+    else:
+        socketio.emit('gameState', compressed_data)
+        # Approximate data size
+        server_stats['bytes_sent'] += len(json.dumps(compressed_data))
+    
+    server_stats['messages_sent'] += 1
 
 def update_server_status():
     """Update server status information."""
@@ -75,6 +136,41 @@ def broadcast_server_status():
     """Broadcast server status to all clients."""
     update_server_status()
     socketio.emit('serverStatus', server_status)
+    server_stats['messages_sent'] += 1
+
+def broadcast_players_batch():
+    """Broadcast player positions in optimal batches."""
+    with game_state_lock:
+        players = game_state['players']
+        
+        # Nothing to broadcast if no players
+        if not players:
+            return
+        
+        # Split players into batches for more efficient updates
+        player_items = list(players.items())
+        
+        for i in range(0, len(player_items), PLAYER_UPDATE_BATCH_SIZE):
+            batch = dict(player_items[i:i+PLAYER_UPDATE_BATCH_SIZE])
+            
+            # Extract minimal position data for broadcast
+            minimal_batch = {}
+            for pid, player in batch.items():
+                minimal_batch[pid] = {
+                    'position': player['position'],
+                    'rotation': player['rotation'],
+                    'team': player['team']
+                }
+            
+            # Compress if large payload
+            compressed_data, is_compressed = compress_data(minimal_batch)
+            
+            if is_compressed:
+                socketio.emit('playersCompressed', compressed_data)
+            else:
+                socketio.emit('players', minimal_batch)
+                
+            server_stats['messages_sent'] += 1
 
 def estimate_wait_time(position):
     """Estimate wait time based on queue position."""
@@ -127,6 +223,32 @@ def assign_team(preferred_team=None):
         
         # Otherwise, assign randomly but favor the smaller team
         return 'red' if red_count <= blue_count else 'blue'
+
+def position_changed_significantly(new_pos, old_pos):
+    """Check if position changed enough to warrant an update."""
+    if not old_pos:
+        return True
+    
+    dx = new_pos[0] - old_pos[0]
+    dy = new_pos[1] - old_pos[1]
+    dz = new_pos[2] - old_pos[2]
+    
+    # Calculate distance squared (faster than using math.sqrt)
+    distance_sq = dx * dx + dy * dy + dz * dz
+    
+    return distance_sq > POSITION_UPDATE_THRESHOLD * POSITION_UPDATE_THRESHOLD
+
+def rotation_changed_significantly(new_rot, old_rot):
+    """Check if rotation changed enough to warrant an update."""
+    if not old_rot:
+        return True
+    
+    # Check each axis
+    for i in range(min(len(new_rot), len(old_rot))):
+        if abs(new_rot[i] - old_rot[i]) > ROTATION_UPDATE_THRESHOLD:
+            return True
+    
+    return False
 
 @socketio.on('connect')
 def handle_connect():
@@ -181,6 +303,8 @@ def handle_disconnect():
 @socketio.on('join')
 def handle_join(data):
     """Handle player join request."""
+    server_stats['messages_received'] += 1
+    
     player_name = data.get('name', f"Player_{uuid.uuid4().hex[:6]}")
     preferred_team = data.get('team', '').lower()
     
@@ -200,7 +324,9 @@ def handle_join(data):
                 'score': 0,
                 'kills': 0,
                 'deaths': 0,
-                'joinTime': time.time()
+                'joinTime': time.time(),
+                'lastPosition': None,
+                'lastRotation': None,
             }
             
             # Add player to game
@@ -247,6 +373,8 @@ def handle_join(data):
 @socketio.on('message')
 def handle_message(data):
     """Handle chat messages."""
+    server_stats['messages_received'] += 1
+    
     if request.sid in game_state['players']:
         player = game_state['players'][request.sid]
         
@@ -260,10 +388,14 @@ def handle_message(data):
         
         # Broadcast message to all players
         socketio.emit('message', message)
+        server_stats['messages_sent'] += 1
 
 @socketio.on('updatePosition')
 def handle_update_position(data):
-    """Handle player position updates."""
+    """Handle player position updates with optimization."""
+    server_stats['messages_received'] += 1
+    server_stats['position_updates'] += 1
+    
     with game_state_lock:
         if request.sid in game_state['players']:
             # Update player position
@@ -271,134 +403,31 @@ def handle_update_position(data):
             position = data.get('position')
             rotation = data.get('rotation')
             
+            # Only process significant changes
+            position_changed = False
+            rotation_changed = False
+            
             if position:
-                player['position'] = position
+                if position_changed_significantly(position, player.get('lastPosition')):
+                    player['position'] = position
+                    player['lastPosition'] = position
+                    position_changed = True
             
             if rotation:
-                player['rotation'] = rotation
+                if rotation_changed_significantly(rotation, player.get('lastRotation')):
+                    player['rotation'] = rotation
+                    player['lastRotation'] = rotation
+                    rotation_changed = True
             
-            # Check for flag proximity and interactions
-            check_flag_interactions(request.sid, player)
-
-def check_flag_interactions(player_sid, player):
-    """Check and handle player interactions with flags."""
-    # Check if player can capture enemy flag
-    if player['team'] == 'red':
-        flag_team = 'blue'
-        enemy_base = [0, 0, 110]
-        home_base = [0, 0, -110]
-    else:
-        flag_team = 'red'
-        enemy_base = [0, 0, -110]
-        home_base = [0, 0, 110]
-    
-    # Get player position as vector
-    player_pos = player['position']
-    
-    # Check if player is near enemy flag
-    enemy_flag = game_state['flags'][flag_team]
-    
-    if not enemy_flag['captured']:
-        # Calculate distance to flag
-        flag_pos = enemy_flag['position']
-        distance = math.sqrt(
-            (player_pos[0] - flag_pos[0])**2 + 
-            (player_pos[1] - flag_pos[1])**2 + 
-            (player_pos[2] - flag_pos[2])**2
-        )
-        
-        # If player is close enough, capture flag
-        if distance < FLAG_CAPTURE_RADIUS:
-            enemy_flag['captured'] = True
-            enemy_flag['carrier'] = player_sid
-            
-            logger.info(f"Player {player['name']} captured the {flag_team} flag!")
-            
-            # Broadcast flag capture
-            socketio.emit('flagCaptured', {
-                'team': flag_team,
-                'carrier': player['name']
-            })
-    
-    # Check if player carrying flag is at home base to score
-    if game_state['flags'][flag_team]['carrier'] == player_sid:
-        # Calculate distance to home base
-        distance_to_home = math.sqrt(
-            (player_pos[0] - home_base[0])**2 +
-            (player_pos[1] - home_base[1])**2 +
-            (player_pos[2] - home_base[2])**2
-        )
-        
-        # If player is close enough to home base, score
-        if distance_to_home < FLAG_CAPTURE_RADIUS:
-            # Reset flag
-            game_state['flags'][flag_team]['captured'] = False
-            game_state['flags'][flag_team]['carrier'] = None
-            
-            # Update score
-            game_state['scores'][player['team']] += FLAG_SCORE_POINTS
-            
-            logger.info(f"Player {player['name']} scored with the {flag_team} flag!")
-            
-            # Broadcast flag score
-            socketio.emit('flagScored', {
-                'team': flag_team,
-                'scorer': player['name'],
-                'redScore': game_state['scores']['red'],
-                'blueScore': game_state['scores']['blue']
-            })
-            
-            # Check win condition
-            if game_state['scores'][player['team']] >= WIN_SCORE:
-                socketio.emit('gameOver', {
-                    'winner': player['team'],
-                    'redScore': game_state['scores']['red'],
-                    'blueScore': game_state['scores']['blue']
-                })
-                
-                # Reset scores for next game
-                game_state['scores']['red'] = 0
-                game_state['scores']['blue'] = 0
-
-@socketio.on('captureFlag')
-def handle_capture_flag(data):
-    """Handle client-initiated flag capture (validation still done server-side)."""
-    flag_team = data.get('team')
-    
-    if flag_team not in ['red', 'blue']:
-        return
-    
-    with game_state_lock:
-        if request.sid in game_state['players']:
-            player = game_state['players'][request.sid]
-            
-            # Only allow capturing enemy flag
-            if (player['team'] == 'red' and flag_team == 'blue') or \
-               (player['team'] == 'blue' and flag_team == 'red'):
-                
-                # Extra validation through check_flag_interactions
-                check_flag_interactions(request.sid, player)
-
-@socketio.on('scoreFlag')
-def handle_score_flag(data):
-    """Handle client-initiated flag scoring (validation still done server-side)."""
-    flag_team = data.get('team')
-    
-    if flag_team not in ['red', 'blue']:
-        return
-    
-    with game_state_lock:
-        if request.sid in game_state['players']:
-            player = game_state['players'][request.sid]
-            
-            # Check if player is carrying the flag
-            if game_state['flags'][flag_team]['carrier'] == request.sid:
-                # Extra validation through check_flag_interactions
+            # Only check for interactions if position changed
+            if position_changed:
                 check_flag_interactions(request.sid, player)
 
 @socketio.on('shoot')
 def handle_shoot(data):
     """Handle player shooting."""
+    server_stats['messages_received'] += 1
+    
     with game_state_lock:
         if request.sid in game_state['players']:
             shooter = game_state['players'][request.sid]
@@ -410,10 +439,13 @@ def handle_shoot(data):
                 'direction': data['direction'],
                 'color': '#ff4500' if shooter['team'] == 'red' else '#0066ff'
             }, broadcast=True)
+            server_stats['messages_sent'] += 1
 
 @socketio.on('hit')
 def handle_hit(data):
     """Handle paintball hits."""
+    server_stats['messages_received'] += 1
+    
     with game_state_lock:
         if data['target'] in game_state['players']:
             target = game_state['players'][data['target']]
@@ -460,6 +492,7 @@ def handle_player_elimination(target_id, shooter_id):
         'player': target['name'],
         'killer': shooter['name']
     })
+    server_stats['messages_sent'] += 1
     
     # Respawn player at their team's base
     if target['team'] == 'red':
@@ -467,23 +500,129 @@ def handle_player_elimination(target_id, shooter_id):
     else:
         target['position'] = [0, 2, 110]  # Blue base
 
+def check_flag_interactions(player_sid, player):
+    """Check and handle player interactions with flags."""
+    # Check if player can capture enemy flag
+    if player['team'] == 'red':
+        flag_team = 'blue'
+        enemy_base = [0, 0, 110]
+        home_base = [0, 0, -110]
+    else:
+        flag_team = 'red'
+        enemy_base = [0, 0, -110]
+        home_base = [0, 0, 110]
+    
+    # Get player position as vector
+    player_pos = player['position']
+    
+    # Check if player is near enemy flag
+    enemy_flag = game_state['flags'][flag_team]
+    
+    if not enemy_flag['captured']:
+        # Calculate distance to flag
+        flag_pos = enemy_flag['position']
+        distance = math.sqrt(
+            (player_pos[0] - flag_pos[0])**2 + 
+            (player_pos[1] - flag_pos[1])**2 + 
+            (player_pos[2] - flag_pos[2])**2
+        )
+        
+        # If player is close enough, capture flag
+        if distance < FLAG_CAPTURE_RADIUS:
+            enemy_flag['captured'] = True
+            enemy_flag['carrier'] = player_sid
+            
+            logger.info(f"Player {player['name']} captured the {flag_team} flag!")
+            
+            # Broadcast flag capture
+            socketio.emit('flagCaptured', {
+                'team': flag_team,
+                'carrier': player['name']
+            })
+            server_stats['messages_sent'] += 1
+    
+    # Check if player carrying flag is at home base to score
+    if game_state['flags'][flag_team]['carrier'] == player_sid:
+        # Calculate distance to home base
+        distance_to_home = math.sqrt(
+            (player_pos[0] - home_base[0])**2 +
+            (player_pos[1] - home_base[1])**2 +
+            (player_pos[2] - home_base[2])**2
+        )
+        
+        # If player is close enough to home base, score
+        if distance_to_home < FLAG_CAPTURE_RADIUS:
+            # Reset flag
+            game_state['flags'][flag_team]['captured'] = False
+            game_state['flags'][flag_team]['carrier'] = None
+            
+            # Update score
+            game_state['scores'][player['team']] += FLAG_SCORE_POINTS
+            
+            logger.info(f"Player {player['name']} scored with the {flag_team} flag!")
+            
+            # Broadcast flag score
+            socketio.emit('flagScored', {
+                'team': flag_team,
+                'scorer': player['name'],
+                'redScore': game_state['scores']['red'],
+                'blueScore': game_state['scores']['blue']
+            })
+            server_stats['messages_sent'] += 1
+            
+            # Check win condition
+            if game_state['scores'][player['team']] >= WIN_SCORE:
+                socketio.emit('gameOver', {
+                    'winner': player['team'],
+                    'redScore': game_state['scores']['red'],
+                    'blueScore': game_state['scores']['blue']
+                })
+                server_stats['messages_sent'] += 1
+                
+                # Reset scores for next game
+                game_state['scores']['red'] = 0
+                game_state['scores']['blue'] = 0
+
 @app.route('/status')
 def server_status_endpoint():
     """API endpoint to get server status."""
     update_server_status()
     return jsonify(server_status)
 
+@app.route('/performance')
+def server_performance_endpoint():
+    """API endpoint to get server performance statistics."""
+    uptime = time.time() - server_stats['start_time']
+    
+    # Calculate rates
+    messages_per_second = server_stats['messages_received'] / uptime if uptime > 0 else 0
+    position_updates_per_second = server_stats['position_updates'] / uptime if uptime > 0 else 0
+    
+    return jsonify({
+        'uptime': int(uptime),
+        'messages_received': server_stats['messages_received'],
+        'messages_sent': server_stats['messages_sent'],
+        'position_updates': server_stats['position_updates'],
+        'messages_per_second': round(messages_per_second, 2),
+        'position_updates_per_second': round(position_updates_per_second, 2),
+        'queue_length': len(game_state['queue']),
+        'player_count': len(game_state['players']),
+    })
+
 @socketio.on('requestServerStatus')
 def handle_server_status_request():
     """Handle client request for server status."""
+    server_stats['messages_received'] += 1
     update_server_status()
     socketio.emit('serverStatus', server_status, room=request.sid)
+    server_stats['messages_sent'] += 1
 
 # Set up regular server status broadcasts
 def background_task():
-    """Background task to periodically broadcast server status."""
+    """Background task to periodically broadcast server status and players."""
     while True:
         broadcast_server_status()
+        broadcast_players_batch()  # Broadcast players in efficient batches
         socketio.sleep(5)  # Update every 5 seconds
 
 if __name__ == '__main__':

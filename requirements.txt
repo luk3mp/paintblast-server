@@ -6,14 +6,14 @@ eventlet==0.33.3
 Flask==2.3.3
 Flask-SocketIO==5.3.6
 greenlet==3.1.1
-gunicorn==20.1.0
+gunicorn
 h11==0.14.0
 itsdangerous==2.2.0
 Jinja2==3.1.6
 MarkupSafe==3.0.2
 python-engineio==4.8.0
 python-socketio==5.10.0
-setuptools==78.1.0
+setuptools
 simple-websocket==1.0.0
 six==1.17.0
 Werkzeug==2.3.7

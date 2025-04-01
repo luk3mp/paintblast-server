@@ -355,6 +355,12 @@ def handle_connect():
     except Exception as e:
         logger.error(f"Error sending initial status to {request.sid}: {str(e)}")
 
+    # Mark client as pending - will be converted to player when they send join
+    with game_state_lock:
+        # This is a temporary placeholder that'll be replaced when the client sends a join event
+        if request.sid not in game_state['players']:
+            logger.debug(f"Adding client to pending list: {request.sid}")
+
 @socketio.on('disconnect')
 def handle_disconnect():
     """Handle client disconnection."""
@@ -406,50 +412,66 @@ def handle_join(data):
     preferred_team = data.get('team', '').lower()
     
     with game_state_lock:
-        # Check if game has space for the player
-        if len(game_state['players']) < MAX_PLAYERS:
-            # Assign team
-            team = assign_team(preferred_team)
-            
-            # Define base position based on team
-            base_pos = [0, 2, -110] if team == 'red' else [0, 2, 110]
-            spawn_pos = calculate_random_spawn(base_pos)
+        # Check if player is already in game (possible reconnect)
+        player_already_exists = request.sid in game_state['players']
+        
+        # Check if game has space for the player or if player is already in
+        if player_already_exists or len(game_state['players']) < MAX_PLAYERS:
+            # If player already exists, just update their status
+            if player_already_exists:
+                player = game_state['players'][request.sid]
+                logger.info(f"Player {player_name} rejoined as {player['team']}")
+                
+                # Send join success to the player who rejoined
+                socketio.emit('joinSuccess', {
+                    'id': request.sid,
+                    'team': player['team'],
+                    'position': player['position']
+                }, room=request.sid)
+            else:
+                # New player - assign team
+                team = assign_team(preferred_team)
+                
+                # Define base position based on team
+                base_pos = [0, 2, -110] if team == 'red' else [0, 2, 110]
+                spawn_pos = calculate_random_spawn(base_pos)
 
-            player = {
-                'name': player_name,
-                'team': team,
-                'health': 100,
-                'position': spawn_pos, # Use randomized spawn
-                'rotation': [0, 0, 0],
-                'score': 0,
-                'kills': 0,
-                'deaths': 0,
-                'is_eliminated': False, # Add eliminated flag
-                'respawn_timer': None, # Store timer object if needed
-                'joinTime': time.time(),
-                'lastPosition': None,
-                'lastRotation': None,
-            }
+                player = {
+                    'name': player_name,
+                    'team': team,
+                    'health': 100,
+                    'position': spawn_pos, # Use randomized spawn
+                    'rotation': [0, 0, 0],
+                    'score': 0,
+                    'kills': 0,
+                    'deaths': 0,
+                    'is_eliminated': False, # Add eliminated flag
+                    'respawn_timer': None, # Store timer object if needed
+                    'joinTime': time.time(),
+                    'lastPosition': None,
+                    'lastRotation': None,
+                }
+                
+                # Add player to game
+                game_state['players'][request.sid] = player
+                logger.info(f"Player {player_name} joined as {team}")
+                
+                # Send join success to the player who joined
+                socketio.emit('joinSuccess', {
+                    'id': request.sid,
+                    'team': team,
+                    'position': spawn_pos # Send initial spawn position
+                }, room=request.sid)
             
-            # Add player to game
-            game_state['players'][request.sid] = player
-            logger.info(f"Player {player_name} joined as {team}")
-            
-            # Send join success to the player who joined
-            socketio.emit('joinSuccess', {
-                'id': request.sid,
-                'team': team,
-                'position': spawn_pos # Send initial spawn position
-            }, room=request.sid)
-            
-            # Emit a more reliable non-blocking broadcast of players
+            # Emit a more reliable non-blocking broadcast of players - TO ALL CLIENTS
             socketio.emit('players', game_state['players'])
             
             # Start a background task to periodically update positions for this player
-            # But make sure to do this non-blocking to avoid worker timeouts
+            # Make sure to do this non-blocking to avoid worker timeouts
+            # Only start if not already running for this player
             socketio.start_background_task(periodic_player_update, request.sid)
             
-            # Update and broadcast server status
+            # Update and broadcast server status TO ALL CLIENTS
             broadcast_server_status()
         else:
             # Server is full, add player to queue
@@ -837,8 +859,18 @@ def background_task():
     """Background task to periodically broadcast server status only (not full player data)."""
     while True:
         try:
-            # Just update and broadcast server status (lightweight operation)
-            broadcast_server_status()
+            # Make sure server status is up to date before broadcasting
+            update_server_status()
+            # Broadcast status to all clients
+            socketio.emit('serverStatus', server_status)
+            server_stats['messages_sent'] += 1
+            
+            # Also regularly broadcast player state to ensure clients stay in sync
+            with game_state_lock:
+                if game_state['players']:
+                    # Only broadcast if there are players to report
+                    socketio.emit('players', game_state['players'])
+                    logger.debug(f"Background task broadcasting {len(game_state['players'])} players")
             
             # Do multiple smaller sleeps instead of one long sleep
             for _ in range(10):  # 10 x 1s = 10s total

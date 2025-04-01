@@ -1,6 +1,7 @@
 import os
-from flask import Flask, request, jsonify
-from flask_socketio import SocketIO, emit
+from flask import Flask, request, jsonify, session
+from flask_socketio import SocketIO, emit, join_room, leave_room
+from flask_cors import CORS
 import math
 import time
 from threading import Lock, Timer
@@ -11,6 +12,7 @@ import json
 import gzip
 import base64
 import random
+import zlib
 
 # Configure logging
 logging.basicConfig(
@@ -20,7 +22,16 @@ logging.basicConfig(
 logger = logging.getLogger('paintblast')
 
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', ping_interval=25, ping_timeout=60)
+app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'a_very_secret_key')
+
+# CORS Configuration
+cors_origins = [
+    "http://localhost:3000",  # Local frontend development
+    "https://paintblast.vercel.app"  # Vercel deployment URL
+    # Add any other origins if needed
+]
+socketio = SocketIO(app, cors_allowed_origins=cors_origins, async_mode='gevent')
+CORS(app, origins=cors_origins, supports_credentials=True)
 
 # Game state
 game_state = {

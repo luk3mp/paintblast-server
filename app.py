@@ -30,7 +30,19 @@ cors_origins = [
     "https://paintblast.vercel.app"  # Vercel deployment URL
     # Add any other origins if needed
 ]
-socketio = SocketIO(app, cors_allowed_origins=cors_origins, async_mode='eventlet')
+
+# Set up SocketIO with proper configuration for Gunicorn
+# ping_timeout and ping_interval help with keeping connections alive
+socketio = SocketIO(
+    app, 
+    cors_allowed_origins=cors_origins, 
+    async_mode='eventlet',
+    ping_timeout=60,
+    ping_interval=25,
+    manage_session=False  # Let Flask handle sessions for better stability
+)
+
+# Apply CORS to regular HTTP routes
 CORS(app, origins=cors_origins, supports_credentials=True)
 
 # Game state
@@ -243,10 +255,35 @@ def rotation_changed_significantly(new_rot, old_rot):
     
     return False
 
+# Set up regular server status broadcasts - SIMPLIFIED VERSION
+def background_task():
+    """Background task to periodically broadcast server status only (not full player data)."""
+    while True:
+        try:
+            # Just update and broadcast server status (lightweight operation)
+            broadcast_server_status()
+            # Sleep for a reasonable interval
+            socketio.sleep(10)  # Longer interval (10s) to reduce load
+        except Exception as e:
+            # Catch and log any exceptions to prevent worker crashes
+            logger.error(f"Error in background task: {str(e)}")
+            socketio.sleep(30)  # Sleep longer if there was an error
+
+# Start background task on first connection
+first_connect = True
+
 @socketio.on('connect')
 def handle_connect():
     """Handle new client connection."""
+    global first_connect
     logger.info(f"Client connected: {request.sid}")
+    
+    # Start background task on first connection
+    if first_connect:
+        socketio.start_background_task(background_task)
+        logger.info("Started background status broadcast task")
+        first_connect = False
+    
     # Send initial server status to the new client
     update_server_status()
     socketio.emit('serverStatus', server_status, room=request.sid)
@@ -331,15 +368,18 @@ def handle_join(data):
             game_state['players'][request.sid] = player
             logger.info(f"Player {player_name} joined as {team}")
             
-            # Send join success
+            # Send join success to the player who joined
             socketio.emit('joinSuccess', {
                 'id': request.sid,
                 'team': team,
                 'position': spawn_pos # Send initial spawn position
             }, room=request.sid)
             
-            # Broadcast player list update
+            # Broadcast player list update to ALL clients
             socketio.emit('players', game_state['players'])
+            
+            # Start a background task to periodically update positions for this player
+            socketio.start_background_task(periodic_player_update, request.sid)
             
             # Update and broadcast server status
             broadcast_server_status()
@@ -368,6 +408,27 @@ def handle_join(data):
             
             # Update and broadcast server status
             broadcast_server_status()
+
+# Add periodic player update task
+def periodic_player_update(sid):
+    """Send periodic position updates for a specific player."""
+    try:
+        # This runs in a background thread for each connected player
+        intervals = 0
+        while sid in game_state['players']:
+            socketio.sleep(2)  # Update every 2 seconds
+            intervals += 1
+            
+            # Broadcast full player list every 10 seconds
+            if intervals % 5 == 0:
+                with game_state_lock:
+                    # Make sure this player hasn't disconnected
+                    if sid in game_state['players']:
+                        # Broadcast current players list to everyone
+                        socketio.emit('players', game_state['players'])
+                        logger.debug(f"Full player state broadcast, {len(game_state['players'])} players")
+    except Exception as e:
+        logger.error(f"Error in periodic player update for {sid}: {str(e)}")
 
 @socketio.on('message')
 def handle_message(data):
@@ -715,14 +776,6 @@ def handle_server_status_request():
     socketio.emit('serverStatus', server_status, room=request.sid)
     server_stats['messages_sent'] += 1
 
-# Set up regular server status broadcasts
-def background_task():
-    """Background task to periodically broadcast server status and players."""
-    while True:
-        broadcast_server_status()
-        broadcast_players_batch()  # Broadcast players in efficient batches
-        socketio.sleep(5)  # Update every 5 seconds
-
 # --- NEW: Helper function for randomized spawn ---
 def calculate_random_spawn(base_pos):
     """Calculates a random position within a radius of the base."""
@@ -732,8 +785,8 @@ def calculate_random_spawn(base_pos):
     offset_z = radius * math.sin(angle)
     return [base_pos[0] + offset_x, base_pos[1], base_pos[2] + offset_z]
 
+# Modify the if __name__ block for development only
 if __name__ == '__main__':
-    logger.info("Starting PaintBlast server...")
-    # socketio.start_background_task(background_task) # Temporarily disable background task
-    # Running without debug/reloader flags for production/stability
+    logger.info("Starting PaintBlast server in development mode...")
+    # The following is for development only, not used in production with Gunicorn
     socketio.run(app, host='0.0.0.0', port=8000) 

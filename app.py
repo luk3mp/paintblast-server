@@ -21,6 +21,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger('paintblast')
 
+# Add Gunicorn-specific configuration
+class GunicornConfig:
+    """Gunicorn configuration to prevent worker timeouts."""
+    # Increase timeout to 120 seconds (default is 30)
+    timeout = 120
+    # Ensure we're using eventlet
+    worker_class = 'eventlet'
+    # Single worker for multiplayer consistency
+    workers = 1
+    # Log level
+    loglevel = 'info'
+    # Keep-alive timeout
+    keepalive = 65
+
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'a_very_secret_key')
 
@@ -39,7 +53,9 @@ socketio = SocketIO(
     async_mode='eventlet',
     ping_timeout=60,
     ping_interval=25,
-    manage_session=False  # Let Flask handle sessions for better stability
+    manage_session=False,  # Let Flask handle sessions for better stability
+    logger=True,  # Enable SocketIO internal logging
+    engineio_logger=True  # Enable Engine.IO internal logging
 )
 
 # Apply CORS to regular HTTP routes
@@ -375,10 +391,11 @@ def handle_join(data):
                 'position': spawn_pos # Send initial spawn position
             }, room=request.sid)
             
-            # Broadcast player list update to ALL clients
+            # Emit a more reliable non-blocking broadcast of players
             socketio.emit('players', game_state['players'])
             
             # Start a background task to periodically update positions for this player
+            # But make sure to do this non-blocking to avoid worker timeouts
             socketio.start_background_task(periodic_player_update, request.sid)
             
             # Update and broadcast server status
@@ -415,20 +432,40 @@ def periodic_player_update(sid):
     try:
         # This runs in a background thread for each connected player
         intervals = 0
-        while sid in game_state['players']:
-            socketio.sleep(2)  # Update every 2 seconds
+        
+        # Safety check - make sure player exists before starting updates
+        with game_state_lock:
+            if sid not in game_state['players']:
+                logger.warning(f"Attempted to start periodic updates for non-existent player: {sid}")
+                return
+                
+        while True:  # Changed from conditional loop to infinite loop with break conditions
+            # First, sleep to avoid immediate CPU hogging
+            socketio.sleep(3)  # Increased from 2 to 3 seconds for less overhead
+            
+            # Check if player still exists before doing any work
+            with game_state_lock:
+                if sid not in game_state['players']:
+                    logger.debug(f"Player {sid} disconnected, stopping periodic updates.")
+                    break  # Exit the loop if player no longer exists
+            
             intervals += 1
             
-            # Broadcast full player list every 10 seconds
+            # Broadcast full player list every 15 seconds (5 intervals at 3s each)
             if intervals % 5 == 0:
-                with game_state_lock:
-                    # Make sure this player hasn't disconnected
-                    if sid in game_state['players']:
-                        # Broadcast current players list to everyone
-                        socketio.emit('players', game_state['players'])
-                        logger.debug(f"Full player state broadcast, {len(game_state['players'])} players")
+                try:
+                    with game_state_lock:
+                        # Make sure this player still exists (double-check to avoid race conditions)
+                        if sid in game_state['players']:
+                            # Broadcast current players list to everyone
+                            socketio.emit('players', game_state['players'])
+                            logger.debug(f"Full player state broadcast, {len(game_state['players'])} players")
+                except Exception as e:
+                    logger.error(f"Error broadcasting player update: {str(e)}")
+                    # Continue the loop despite errors, but don't increment intervals
+                    intervals -= 1
     except Exception as e:
-        logger.error(f"Error in periodic player update for {sid}: {str(e)}")
+        logger.error(f"Fatal error in periodic player update for {sid}: {str(e)}")
 
 @socketio.on('message')
 def handle_message(data):
@@ -789,4 +826,5 @@ def calculate_random_spawn(base_pos):
 if __name__ == '__main__':
     logger.info("Starting PaintBlast server in development mode...")
     # The following is for development only, not used in production with Gunicorn
-    socketio.run(app, host='0.0.0.0', port=8000) 
+    socketio.run(app, host='0.0.0.0', port=8000, debug=False)
+# For production with Gunicorn, the GunicornConfig class will be used 

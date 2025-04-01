@@ -152,38 +152,18 @@ def broadcast_server_status():
     server_stats['messages_sent'] += 1
 
 def broadcast_players_batch():
-    """Broadcast player positions in optimal batches."""
+    """Broadcast player state (full data)."""
+    # Removed batching and compression for simplification - send full state
     with game_state_lock:
-        players = game_state['players']
-        
-        # Nothing to broadcast if no players
-        if not players:
+        players_data = game_state['players']
+
+        if not players_data:
             return
-        
-        # Split players into batches for more efficient updates
-        player_items = list(players.items())
-        
-        for i in range(0, len(player_items), PLAYER_UPDATE_BATCH_SIZE):
-            batch = dict(player_items[i:i+PLAYER_UPDATE_BATCH_SIZE])
-            
-            # Extract minimal position data for broadcast
-            minimal_batch = {}
-            for pid, player in batch.items():
-                minimal_batch[pid] = {
-                    'position': player['position'],
-                    'rotation': player['rotation'],
-                    'team': player['team']
-                }
-            
-            # Compress if large payload
-            compressed_data, is_compressed = compress_data(minimal_batch)
-            
-            if is_compressed:
-                socketio.emit('playersCompressed', compressed_data)
-            else:
-                socketio.emit('players', minimal_batch)
-                
-            server_stats['messages_sent'] += 1
+
+        # Send the complete player data
+        # No need for minimal_batch or compression handling for now
+        socketio.emit('players', players_data)
+        server_stats['messages_sent'] += 1
 
 def estimate_wait_time(position):
     """Estimate wait time based on queue position."""

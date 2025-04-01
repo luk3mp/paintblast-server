@@ -369,95 +369,100 @@ def handle_join(data):
     
     logger.info(f"Join request from {player_name} (SID: {request.sid}) with team preference: {preferred_team}")
     
-    with game_state_lock:
-        # Check if player is already in game (possible reconnect)
-        player_already_exists = request.sid in game_state['players']
-        
-        # Check if game has space for the player or if player is already in
-        if player_already_exists or len(game_state['players']) < MAX_PLAYERS:
-            # If player already exists, just update their status
-            if player_already_exists:
-                player = game_state['players'][request.sid]
-                logger.info(f"Player {player_name} rejoined as {player['team']}")
-                
-                # Send join success to the player who rejoined
-                socketio.emit('joinSuccess', {
-                    'id': request.sid,
-                    'team': player['team'],
-                    'position': player['position']
-                }, room=request.sid)
-            else:
-                # New player - assign team
-                team = assign_team(preferred_team)
-                
-                # Define base position based on team
-                base_pos = [0, 2, -110] if team == 'red' else [0, 2, 110]
-                spawn_pos = calculate_random_spawn(base_pos)
+    try:
+        with game_state_lock:
+            # Check if player is already in game (possible reconnect)
+            player_already_exists = request.sid in game_state['players']
+            
+            # Check if game has space for the player or if player is already in
+            if player_already_exists or len(game_state['players']) < MAX_PLAYERS:
+                # If player already exists, just update their status
+                if player_already_exists:
+                    player = game_state['players'][request.sid]
+                    logger.info(f"Player {player_name} rejoined as {player['team']}")
+                    
+                    # Send join success to the player who rejoined
+                    socketio.emit('joinSuccess', {
+                        'id': request.sid,
+                        'team': player['team'],
+                        'position': player['position']
+                    }, room=request.sid)
+                else:
+                    # New player - assign team
+                    team = assign_team(preferred_team)
+                    
+                    # Define base position based on team
+                    base_pos = [0, 2, -110] if team == 'red' else [0, 2, 110]
+                    spawn_pos = calculate_random_spawn(base_pos)
 
-                player = {
+                    player = {
+                        'name': player_name,
+                        'team': team,
+                        'health': 100,
+                        'position': spawn_pos, # Use randomized spawn
+                        'rotation': [0, 0, 0],
+                        'score': 0,
+                        'kills': 0,
+                        'deaths': 0,
+                        'is_eliminated': False, 
+                        'respawn_timer': None,
+                        'joinTime': time.time(),
+                        'lastPosition': None,
+                        'lastRotation': None,
+                    }
+                    
+                    # Add player to game
+                    game_state['players'][request.sid] = player
+                    logger.info(f"Player {player_name} joined as {team}, total players: {len(game_state['players'])}")
+                    
+                    # Send join success to the player who joined
+                    socketio.emit('joinSuccess', {
+                        'id': request.sid,
+                        'team': team,
+                        'position': spawn_pos
+                    }, room=request.sid)
+                
+                # Update server status to reflect new player count
+                update_server_status()
+                
+                # Broadcast updated status and player list to ALL clients
+                socketio.emit('serverStatus', server_status)
+                logger.info(f"Broadcasting server status with {server_status['currentPlayers']} players")
+                
+                # Broadcast player list to ALL clients
+                socketio.emit('players', game_state['players'])
+                logger.info(f"Broadcasting player list with {len(game_state['players'])} players")
+                
+            else:
+                # Server is full, add player to queue
+                queue_player = {
+                    'sid': request.sid,
                     'name': player_name,
-                    'team': team,
-                    'health': 100,
-                    'position': spawn_pos, # Use randomized spawn
-                    'rotation': [0, 0, 0],
-                    'score': 0,
-                    'kills': 0,
-                    'deaths': 0,
-                    'is_eliminated': False, 
-                    'respawn_timer': None,
-                    'joinTime': time.time(),
-                    'lastPosition': None,
-                    'lastRotation': None,
+                    'preferred_team': preferred_team,
+                    'joinTime': time.time()
                 }
                 
-                # Add player to game
-                game_state['players'][request.sid] = player
-                logger.info(f"Player {player_name} joined as {team}, total players: {len(game_state['players'])}")
+                # Add to queue
+                game_state['queue'].append(queue_player)
                 
-                # Send join success to the player who joined
-                socketio.emit('joinSuccess', {
-                    'id': request.sid,
-                    'team': team,
-                    'position': spawn_pos
+                # Calculate queue position (1-based)
+                position = len(game_state['queue'])
+                
+                logger.info(f"Server full, {player_name} added to queue at position {position}")
+                
+                # Send queue position to player
+                socketio.emit('queueUpdate', {
+                    'position': position,
+                    'estimatedWaitTime': estimate_wait_time(position - 1)
                 }, room=request.sid)
-            
-            # Update server status to reflect new player count
-            update_server_status()
-            
-            # Broadcast updated status and player list to ALL clients
-            socketio.emit('serverStatus', server_status)
-            logger.info(f"Broadcasting server status with {server_status['currentPlayers']} players")
-            
-            # Broadcast player list to ALL clients
-            socketio.emit('players', game_state['players'])
-            logger.info(f"Broadcasting player list with {len(game_state['players'])} players")
-            
-        else:
-            # Server is full, add player to queue
-            queue_player = {
-                'sid': request.sid,
-                'name': player_name,
-                'preferred_team': preferred_team,
-                'joinTime': time.time()
-            }
-            
-            # Add to queue
-            game_state['queue'].append(queue_player)
-            
-            # Calculate queue position (1-based)
-            position = len(game_state['queue'])
-            
-            logger.info(f"Server full, {player_name} added to queue at position {position}")
-            
-            # Send queue position to player
-            socketio.emit('queueUpdate', {
-                'position': position,
-                'estimatedWaitTime': estimate_wait_time(position - 1)
-            }, room=request.sid)
-            
-            # Update and broadcast server status
-            update_server_status()
-            socketio.emit('serverStatus', server_status)
+                
+                # Update and broadcast server status
+                update_server_status()
+                socketio.emit('serverStatus', server_status)
+    except Exception as e:
+        logger.error(f"Error in handle_join: {str(e)}")
+        # In case of error, send error message to client
+        socketio.emit('connectionError', {'message': 'Error joining game'}, room=request.sid)
 
 @socketio.on('message')
 def handle_message(data):
@@ -820,40 +825,50 @@ def background_task():
     iteration = 0
     max_iterations = 86400  # 24 hours at 1 sec per iteration
     
-    while iteration < max_iterations:
-        try:
-            # Update counters
-            iteration += 1
-            
-            # Always update and broadcast server status every iteration
-            update_server_status()
-            logger.info(f"Background task status: {server_status['currentPlayers']} players")
-            socketio.emit('serverStatus', server_status)
-            server_stats['messages_sent'] += 1
-            
-            # Broadcast full player list every 2 seconds (every other iteration)
-            if iteration % 2 == 0 and game_state['players']:
-                with game_state_lock:
-                    try:
-                        # Only broadcast if we have players
-                        if game_state['players']:
-                            socketio.emit('players', game_state['players'])
-                            logger.debug(f"Background broadcasting {len(game_state['players'])} players")
-                    except Exception as e:
-                        logger.error(f"Error broadcasting players: {str(e)}")
-            
-            # Sleep for 1 second between iterations
-            socketio.sleep(1)
+    try:
+        logger.info("Starting background task")
+        
+        while iteration < max_iterations:
+            try:
+                # Update counters
+                iteration += 1
                 
-        except Exception as e:
-            # Catch and log any exceptions
-            logger.error(f"Error in background task: {str(e)}")
-            # Sleep a bit in case of error
-            socketio.sleep(1)
-    
-    # If we somehow exit the loop, restart the task to ensure continuous operation
-    logger.warning("Background task completed max iterations, restarting")
-    socketio.start_background_task(background_task)
+                # Always update and broadcast server status every iteration
+                update_server_status()
+                logger.debug(f"Background task status: {server_status['currentPlayers']} players")
+                socketio.emit('serverStatus', server_status)
+                server_stats['messages_sent'] += 1
+                
+                # Broadcast full player list every 2 seconds (every other iteration)
+                if iteration % 2 == 0:
+                    with game_state_lock:
+                        try:
+                            # Only broadcast if we have players
+                            if game_state['players']:
+                                socketio.emit('players', game_state['players'])
+                                logger.debug(f"Broadcasting {len(game_state['players'])} players")
+                        except Exception as e:
+                            logger.error(f"Error broadcasting players: {str(e)}")
+                
+                # Sleep for 1 second between iterations
+                socketio.sleep(1)
+                    
+            except Exception as e:
+                # Catch and log any exceptions within the loop
+                logger.error(f"Error in background task iteration: {str(e)}")
+                # Sleep a bit in case of error to prevent rapid error loops
+                socketio.sleep(1)
+        
+        # If we somehow exit the loop, restart the task to ensure continuous operation
+        logger.warning("Background task completed max iterations, restarting")
+        socketio.start_background_task(background_task)
+        
+    except Exception as e:
+        # Catch and log any exceptions at the top level
+        logger.error(f"Fatal error in background task, attempting restart: {str(e)}")
+        # Wait a moment before restarting to prevent rapid restart loops
+        socketio.sleep(5)
+        socketio.start_background_task(background_task)
 
 # Run the SocketIO server if executed directly
 if __name__ == '__main__':

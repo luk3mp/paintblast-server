@@ -125,9 +125,6 @@ server_stats = {
     'start_time': time.time()
 }
 
-# Track active player update tasks
-active_player_tasks = {}
-
 def compress_data(data):
     """Compress data if it exceeds threshold."""
     if not ENABLE_COMPRESSION:
@@ -282,64 +279,6 @@ def rotation_changed_significantly(new_rot, old_rot):
     
     return False
 
-# Completely rewritten periodic_player_update function to be more reliable and simpler
-def periodic_player_update(sid, max_iterations=600):  # Limit to ~10 minutes max (600 iterations at 1 sec each)
-    """Send periodic position updates for a specific player with safety limits."""
-    try:
-        # This runs in a background thread for each connected player
-        iterations = 0
-        
-        # Initial safety check - make sure player exists before starting updates
-        with game_state_lock:
-            if sid not in game_state['players']:
-                logger.warning(f"Cannot start periodic updates - player {sid} not found")
-                return
-            else:
-                player = game_state['players'][sid]
-                logger.info(f"Starting periodic updates for player {player['name']} (SID: {sid})")
-        
-        # Main update loop with iteration limit
-        while iterations < max_iterations:
-            # Safety sleep to prevent CPU hogging
-            socketio.sleep(1)
-            
-            # Check if player still exists
-            with game_state_lock:
-                if sid not in game_state['players']:
-                    logger.info(f"Player {sid} no longer exists, ending updates.")
-                    # Clean up from active tasks tracker
-                    if sid in active_player_tasks:
-                        del active_player_tasks[sid]
-                    return
-            
-            # Only broadcast full updates occasionally to avoid overloading
-            if iterations % 5 == 0:  # Every 5 seconds
-                try:
-                    with game_state_lock:
-                        # Check again that player exists
-                        if sid not in game_state['players']:
-                            return
-                        
-                        # No need to broadcast here - main background task handles this
-                except Exception as e:
-                    logger.error(f"Error in periodic player update: {str(e)}")
-            
-            # Increment counter
-            iterations += 1
-            
-        logger.warning(f"Reached max iterations for player {sid}, ending task")
-        # Clean up from active tasks tracker
-        with game_state_lock:
-            if sid in active_player_tasks:
-                del active_player_tasks[sid]
-                
-    except Exception as e:
-        logger.error(f"Fatal error in periodic player update for {sid}: {str(e)}")
-        # Clean up from active tasks tracker
-        with game_state_lock:
-            if sid in active_player_tasks:
-                del active_player_tasks[sid]
-
 # Start background task on first connection
 first_connect = True
 
@@ -384,10 +323,6 @@ def handle_disconnect():
     logger.info(f"Client disconnected: {request.sid}")
     
     with game_state_lock:
-        # Remove player from active tasks list
-        if request.sid in active_player_tasks:
-            del active_player_tasks[request.sid]
-            
         # Check if player was in the game
         if request.sid in game_state['players']:
             # Remove player from game
@@ -468,8 +403,8 @@ def handle_join(data):
                     'score': 0,
                     'kills': 0,
                     'deaths': 0,
-                    'is_eliminated': False, # Add eliminated flag
-                    'respawn_timer': None, # Store timer object if needed
+                    'is_eliminated': False, 
+                    'respawn_timer': None,
                     'joinTime': time.time(),
                     'lastPosition': None,
                     'lastRotation': None,
@@ -483,27 +418,20 @@ def handle_join(data):
                 socketio.emit('joinSuccess', {
                     'id': request.sid,
                     'team': team,
-                    'position': spawn_pos # Send initial spawn position
+                    'position': spawn_pos
                 }, room=request.sid)
             
-            # Make sure server status is updated to reflect new player count
+            # Update server status to reflect new player count
             update_server_status()
             
-            # Immediately broadcast updated status and player list to ALL clients
-            # This ensures everyone knows about the new player right away
+            # Broadcast updated status and player list to ALL clients
             socketio.emit('serverStatus', server_status)
             logger.info(f"Broadcasting server status with {server_status['currentPlayers']} players")
             
-            # Emit a more reliable non-blocking broadcast of players - TO ALL CLIENTS
+            # Broadcast player list to ALL clients
             socketio.emit('players', game_state['players'])
             logger.info(f"Broadcasting player list with {len(game_state['players'])} players")
             
-            # Only start a background task if we don't already have one for this player
-            if request.sid not in active_player_tasks:
-                # Use a direct broadcast instead of starting a new task
-                # This prevents too many threads
-                active_player_tasks[request.sid] = True
-                
         else:
             # Server is full, add player to queue
             queue_player = {
@@ -886,11 +814,13 @@ def calculate_random_spawn(base_pos):
     offset_z = radius * math.sin(angle)
     return [base_pos[0] + offset_x, base_pos[1], base_pos[2] + offset_z]
 
-# Update the background task function to be more reliable and handle all player updates
+# Update the background task function to handle all player updates centrally
 def background_task():
     """Background task to broadcast server status and player information periodically."""
     iteration = 0
-    while True:
+    max_iterations = 86400  # 24 hours at 1 sec per iteration
+    
+    while iteration < max_iterations:
         try:
             # Update counters
             iteration += 1
@@ -901,7 +831,7 @@ def background_task():
             socketio.emit('serverStatus', server_status)
             server_stats['messages_sent'] += 1
             
-            # Broadcast full player list every 2 seconds (every second iteration)
+            # Broadcast full player list every 2 seconds (every other iteration)
             if iteration % 2 == 0 and game_state['players']:
                 with game_state_lock:
                     try:
@@ -920,6 +850,10 @@ def background_task():
             logger.error(f"Error in background task: {str(e)}")
             # Sleep a bit in case of error
             socketio.sleep(1)
+    
+    # If we somehow exit the loop, restart the task to ensure continuous operation
+    logger.warning("Background task completed max iterations, restarting")
+    socketio.start_background_task(background_task)
 
 # Run the SocketIO server if executed directly
 if __name__ == '__main__':

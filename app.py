@@ -21,19 +21,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger('paintblast')
 
-# Add Gunicorn-specific configuration
+# Update Gunicorn configuration
 class GunicornConfig:
     """Gunicorn configuration to prevent worker timeouts."""
-    # Increase timeout to 120 seconds (default is 30)
-    timeout = 120
+    # Increase timeout to 300 seconds (5 minutes)
+    timeout = 300
     # Ensure we're using eventlet
     worker_class = 'eventlet'
     # Single worker for multiplayer consistency
     workers = 1
+    # Increase threads per worker for better concurrency
+    threads = 4
     # Log level
     loglevel = 'info'
-    # Keep-alive timeout
-    keepalive = 65
+    # Increase keep-alive timeout
+    keepalive = 120
+    # Prevent worker crashes from terminating the application
+    max_requests = 1000
+    max_requests_jitter = 50
+    graceful_timeout = 10
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'a_very_secret_key')
@@ -55,7 +61,9 @@ socketio = SocketIO(
     ping_interval=25,
     manage_session=False,  # Let Flask handle sessions for better stability
     logger=True,  # Enable SocketIO internal logging
-    engineio_logger=True  # Enable Engine.IO internal logging
+    engineio_logger=True,  # Enable Engine.IO internal logging
+    max_http_buffer_size=1e8,  # Increase buffer size to 100MB
+    always_connect=True  # Always accept connections
 )
 
 # Apply CORS to regular HTTP routes
@@ -271,19 +279,56 @@ def rotation_changed_significantly(new_rot, old_rot):
     
     return False
 
-# Set up regular server status broadcasts - SIMPLIFIED VERSION
-def background_task():
-    """Background task to periodically broadcast server status only (not full player data)."""
-    while True:
-        try:
-            # Just update and broadcast server status (lightweight operation)
-            broadcast_server_status()
-            # Sleep for a reasonable interval
-            socketio.sleep(10)  # Longer interval (10s) to reduce load
-        except Exception as e:
-            # Catch and log any exceptions to prevent worker crashes
-            logger.error(f"Error in background task: {str(e)}")
-            socketio.sleep(30)  # Sleep longer if there was an error
+# Update the periodic_player_update function to be more resilient
+def periodic_player_update(sid):
+    """Send periodic position updates for a specific player."""
+    try:
+        # This runs in a background thread for each connected player
+        intervals = 0
+        
+        # Safety check - make sure player exists before starting updates
+        with game_state_lock:
+            if sid not in game_state['players']:
+                logger.warning(f"Attempted to start periodic updates for non-existent player: {sid}")
+                return
+        
+        # Use a smaller sleep interval with more error catching        
+        while True:  
+            try:
+                # First, sleep to avoid immediate CPU hogging - use multiple smaller sleeps
+                for _ in range(3):  # 3 x 1s = 3s total
+                    socketio.sleep(1)
+                    # Quick check if player still exists, to exit earlier if needed
+                    if sid not in game_state['players']:
+                        return
+            
+                # Main check if player still exists before doing any work
+                with game_state_lock:
+                    if sid not in game_state['players']:
+                        logger.debug(f"Player {sid} disconnected, stopping periodic updates.")
+                        break  # Exit the loop if player no longer exists
+            
+                intervals += 1
+            
+                # Broadcast full player list every 15 seconds (5 intervals at 3s each)
+                if intervals % 5 == 0:
+                    try:
+                        with game_state_lock:
+                            # Make sure this player still exists (double-check to avoid race conditions)
+                            if sid in game_state['players']:
+                                # Broadcast current players list to everyone
+                                socketio.emit('players', game_state['players'])
+                                logger.debug(f"Full player state broadcast, {len(game_state['players'])} players")
+                    except Exception as e:
+                        logger.error(f"Error broadcasting player update: {str(e)}")
+                        # Continue the loop despite errors, but don't increment intervals
+                        intervals -= 1
+            except Exception as e:
+                logger.error(f"Error in periodic_player_update loop for {sid}: {str(e)}")
+                # Sleep a bit longer on error to avoid tight error loops
+                socketio.sleep(5)
+    except Exception as e:
+        logger.error(f"Fatal error in periodic player update for {sid}: {str(e)}")
 
 # Start background task on first connection
 first_connect = True
@@ -294,15 +339,21 @@ def handle_connect():
     global first_connect
     logger.info(f"Client connected: {request.sid}")
     
-    # Start background task on first connection
+    # Start background task on first connection - with error handling
     if first_connect:
-        socketio.start_background_task(background_task)
-        logger.info("Started background status broadcast task")
-        first_connect = False
+        try:
+            socketio.start_background_task(background_task)
+            logger.info("Started background status broadcast task")
+            first_connect = False
+        except Exception as e:
+            logger.error(f"Failed to start background task: {str(e)}")
     
     # Send initial server status to the new client
-    update_server_status()
-    socketio.emit('serverStatus', server_status, room=request.sid)
+    try:
+        update_server_status()
+        socketio.emit('serverStatus', server_status, room=request.sid)
+    except Exception as e:
+        logger.error(f"Error sending initial status to {request.sid}: {str(e)}")
 
 @socketio.on('disconnect')
 def handle_disconnect():
@@ -425,47 +476,6 @@ def handle_join(data):
             
             # Update and broadcast server status
             broadcast_server_status()
-
-# Add periodic player update task
-def periodic_player_update(sid):
-    """Send periodic position updates for a specific player."""
-    try:
-        # This runs in a background thread for each connected player
-        intervals = 0
-        
-        # Safety check - make sure player exists before starting updates
-        with game_state_lock:
-            if sid not in game_state['players']:
-                logger.warning(f"Attempted to start periodic updates for non-existent player: {sid}")
-                return
-                
-        while True:  # Changed from conditional loop to infinite loop with break conditions
-            # First, sleep to avoid immediate CPU hogging
-            socketio.sleep(3)  # Increased from 2 to 3 seconds for less overhead
-            
-            # Check if player still exists before doing any work
-            with game_state_lock:
-                if sid not in game_state['players']:
-                    logger.debug(f"Player {sid} disconnected, stopping periodic updates.")
-                    break  # Exit the loop if player no longer exists
-            
-            intervals += 1
-            
-            # Broadcast full player list every 15 seconds (5 intervals at 3s each)
-            if intervals % 5 == 0:
-                try:
-                    with game_state_lock:
-                        # Make sure this player still exists (double-check to avoid race conditions)
-                        if sid in game_state['players']:
-                            # Broadcast current players list to everyone
-                            socketio.emit('players', game_state['players'])
-                            logger.debug(f"Full player state broadcast, {len(game_state['players'])} players")
-                except Exception as e:
-                    logger.error(f"Error broadcasting player update: {str(e)}")
-                    # Continue the loop despite errors, but don't increment intervals
-                    intervals -= 1
-    except Exception as e:
-        logger.error(f"Fatal error in periodic player update for {sid}: {str(e)}")
 
 @socketio.on('message')
 def handle_message(data):
@@ -822,9 +832,36 @@ def calculate_random_spawn(base_pos):
     offset_z = radius * math.sin(angle)
     return [base_pos[0] + offset_x, base_pos[1], base_pos[2] + offset_z]
 
-# Modify the if __name__ block for development only
+# Update the background task function for more resilience
+def background_task():
+    """Background task to periodically broadcast server status only (not full player data)."""
+    while True:
+        try:
+            # Just update and broadcast server status (lightweight operation)
+            broadcast_server_status()
+            
+            # Do multiple smaller sleeps instead of one long sleep
+            for _ in range(10):  # 10 x 1s = 10s total
+                socketio.sleep(1)
+                
+        except Exception as e:
+            # Catch and log any exceptions to prevent worker crashes
+            logger.error(f"Error in background task: {str(e)}")
+            # Sleep a bit, but not too long
+            socketio.sleep(5)
+
+# Run the SocketIO server if executed directly
 if __name__ == '__main__':
-    logger.info("Starting PaintBlast server in development mode...")
-    # The following is for development only, not used in production with Gunicorn
-    socketio.run(app, host='0.0.0.0', port=8000, debug=False)
-# For production with Gunicorn, the GunicornConfig class will be used 
+    port = int(os.environ.get('PORT', 8000))
+    # Use different debug settings based on environment
+    debug_mode = os.environ.get('DEBUG', 'False').lower() == 'true'
+    
+    # Log startup information
+    logger.info(f"Starting PaintBlast server on port {port}, debug={debug_mode}")
+    logger.info(f"Using async_mode: {socketio.async_mode}")
+    
+    try:
+        # Run with eventlet for production-like behavior even in development
+        socketio.run(app, host='0.0.0.0', port=port, debug=debug_mode)
+    except Exception as e:
+        logger.critical(f"Failed to start server: {str(e)}") 

@@ -30,7 +30,7 @@ cors_origins = [
     "https://paintblast.vercel.app"  # Vercel deployment URL
     # Add any other origins if needed
 ]
-socketio = SocketIO(app, cors_allowed_origins=cors_origins, async_mode='gevent')
+socketio = SocketIO(app, cors_allowed_origins=cors_origins, async_mode='eventlet')
 CORS(app, origins=cors_origins, supports_credentials=True)
 
 # Game state

@@ -291,12 +291,15 @@ def periodic_player_update(sid):
             if sid not in game_state['players']:
                 logger.warning(f"Attempted to start periodic updates for non-existent player: {sid}")
                 return
+            else:
+                player = game_state['players'][sid]
+                logger.info(f"Starting periodic updates for player {player['name']} (SID: {sid})")
         
         # Use a smaller sleep interval with more error catching        
         while True:  
             try:
                 # First, sleep to avoid immediate CPU hogging - use multiple smaller sleeps
-                for _ in range(3):  # 3 x 1s = 3s total
+                for _ in range(1):  # 1 x 1s = 1s total (reduced from 3s)
                     socketio.sleep(1)
                     # Quick check if player still exists, to exit earlier if needed
                     if sid not in game_state['players']:
@@ -310,14 +313,17 @@ def periodic_player_update(sid):
             
                 intervals += 1
             
-                # Broadcast full player list every 15 seconds (5 intervals at 3s each)
-                if intervals % 5 == 0:
+                # Broadcast full player list more frequently (every 2 seconds instead of 15)
+                if intervals % 2 == 0:
                     try:
                         with game_state_lock:
                             # Make sure this player still exists (double-check to avoid race conditions)
                             if sid in game_state['players']:
                                 # Broadcast current players list to everyone
                                 socketio.emit('players', game_state['players'])
+                                # Also update and broadcast server status
+                                update_server_status()
+                                socketio.emit('serverStatus', server_status)
                                 logger.debug(f"Full player state broadcast, {len(game_state['players'])} players")
                     except Exception as e:
                         logger.error(f"Error broadcasting player update: {str(e)}")
@@ -326,7 +332,7 @@ def periodic_player_update(sid):
             except Exception as e:
                 logger.error(f"Error in periodic_player_update loop for {sid}: {str(e)}")
                 # Sleep a bit longer on error to avoid tight error loops
-                socketio.sleep(5)
+                socketio.sleep(2)  # Reduced from 5s
     except Exception as e:
         logger.error(f"Fatal error in periodic player update for {sid}: {str(e)}")
 
@@ -350,8 +356,15 @@ def handle_connect():
     
     # Send initial server status to the new client
     try:
+        # Make sure we're sending current info
         update_server_status()
         socketio.emit('serverStatus', server_status, room=request.sid)
+        
+        # Also send current player list to the new client
+        with game_state_lock:
+            if game_state['players']:
+                logger.info(f"Sending initial player list to new client: {len(game_state['players'])} players")
+                socketio.emit('players', game_state['players'], room=request.sid)
     except Exception as e:
         logger.error(f"Error sending initial status to {request.sid}: {str(e)}")
 
@@ -411,6 +424,8 @@ def handle_join(data):
     player_name = data.get('name', f"Player_{uuid.uuid4().hex[:6]}")
     preferred_team = data.get('team', '').lower()
     
+    logger.info(f"Join request from {player_name} (SID: {request.sid}) with team preference: {preferred_team}")
+    
     with game_state_lock:
         # Check if player is already in game (possible reconnect)
         player_already_exists = request.sid in game_state['players']
@@ -454,7 +469,7 @@ def handle_join(data):
                 
                 # Add player to game
                 game_state['players'][request.sid] = player
-                logger.info(f"Player {player_name} joined as {team}")
+                logger.info(f"Player {player_name} joined as {team}, total players: {len(game_state['players'])}")
                 
                 # Send join success to the player who joined
                 socketio.emit('joinSuccess', {
@@ -463,16 +478,23 @@ def handle_join(data):
                     'position': spawn_pos # Send initial spawn position
                 }, room=request.sid)
             
+            # Make sure server status is updated to reflect new player count
+            update_server_status()
+            
+            # Immediately broadcast updated status and player list to ALL clients
+            # This ensures everyone knows about the new player right away
+            socketio.emit('serverStatus', server_status)
+            logger.info(f"Broadcasting server status with {server_status['currentPlayers']} players")
+            
             # Emit a more reliable non-blocking broadcast of players - TO ALL CLIENTS
             socketio.emit('players', game_state['players'])
+            logger.info(f"Broadcasting player list with {len(game_state['players'])} players")
             
             # Start a background task to periodically update positions for this player
             # Make sure to do this non-blocking to avoid worker timeouts
             # Only start if not already running for this player
             socketio.start_background_task(periodic_player_update, request.sid)
             
-            # Update and broadcast server status TO ALL CLIENTS
-            broadcast_server_status()
         else:
             # Server is full, add player to queue
             queue_player = {
@@ -497,7 +519,8 @@ def handle_join(data):
             }, room=request.sid)
             
             # Update and broadcast server status
-            broadcast_server_status()
+            update_server_status()
+            socketio.emit('serverStatus', server_status)
 
 @socketio.on('message')
 def handle_message(data):
@@ -861,6 +884,10 @@ def background_task():
         try:
             # Make sure server status is up to date before broadcasting
             update_server_status()
+            
+            # Log status periodically for debugging
+            logger.info(f"Background task status: {server_status['currentPlayers']} players")
+            
             # Broadcast status to all clients
             socketio.emit('serverStatus', server_status)
             server_stats['messages_sent'] += 1
@@ -873,14 +900,14 @@ def background_task():
                     logger.debug(f"Background task broadcasting {len(game_state['players'])} players")
             
             # Do multiple smaller sleeps instead of one long sleep
-            for _ in range(10):  # 10 x 1s = 10s total
+            for _ in range(5):  # 5 x 1s = 5s total (reduced from 10s)
                 socketio.sleep(1)
                 
         except Exception as e:
             # Catch and log any exceptions to prevent worker crashes
             logger.error(f"Error in background task: {str(e)}")
             # Sleep a bit, but not too long
-            socketio.sleep(5)
+            socketio.sleep(3)  # Reduced from 5s
 
 # Run the SocketIO server if executed directly
 if __name__ == '__main__':

@@ -734,5 +734,5 @@ def calculate_random_spawn(base_pos):
 
 if __name__ == '__main__':
     logger.info("Starting PaintBlast server...")
-    socketio.start_background_task(background_task)
+    # socketio.start_background_task(background_task) # Temporarily disable background task
     socketio.run(app, host='0.0.0.0', port=8000, debug=True, allow_unsafe_werkzeug=True) 

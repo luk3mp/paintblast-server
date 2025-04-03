@@ -832,49 +832,60 @@ def background_task():
     """Background task to broadcast server status and player information periodically."""
     iteration = 0
     max_iterations = 86400  # 24 hours at 1 sec per iteration
-    
+
     try:
         logger.info("Starting background task")
-        
+
         while iteration < max_iterations:
+            # Data to be emitted, prepared inside the lock
+            current_server_status = None
+            current_players_state = None
+            should_broadcast_players = False
+
             try:
                 # Update counters
                 iteration += 1
-                
-                # Always update and broadcast server status every iteration
-                update_server_status()
-                logger.debug(f"Background task status: {server_status['currentPlayers']} players")
-                socketio.emit('serverStatus', server_status)
-                server_stats['messages_sent'] += 1
-                
-                # Broadcast full player list every 2 seconds (every other iteration)
-                if iteration % 2 == 0:
-                    with game_state_lock:
-                        try:
-                            # Only broadcast if we have players
-                            if game_state['players']:
-                                socketio.emit('players', game_state['players'])
-                                logger.debug(f"Broadcasting {len(game_state['players'])} players")
-                        except Exception as e:
-                            logger.error(f"Error broadcasting players: {str(e)}")
-                
-                # Sleep for 1 second between iterations
+
+                # Acquire lock, prepare data, release lock
+                with game_state_lock:
+                    # Always update status
+                    update_server_status()
+                    current_server_status = server_status.copy()
+                    logger.debug(f"Background task status: {current_server_status.get('currentPlayers', 0)} players")
+
+                    # Prepare player list broadcast every 2 seconds
+                    if iteration % 2 == 0:
+                        if game_state['players']:
+                            current_players_state = game_state['players'].copy()
+                            should_broadcast_players = True
+
+                # --- Lock is released here ---
+
+                # Perform emits outside the lock
+                if current_server_status:
+                    socketio.emit('serverStatus', current_server_status)
+                    server_stats['messages_sent'] += 1
+
+                if should_broadcast_players and current_players_state is not None:
+                    try:
+                        socketio.emit('players', current_players_state)
+                        logger.debug(f"Broadcasting {len(current_players_state)} players")
+                        server_stats['messages_sent'] += 1 # Increment only if players were actually sent
+                    except Exception as e:
+                        logger.error(f"Error broadcasting players: {str(e)}")
+
+                # Sleep for 1 second between iterations, yielding control
                 socketio.sleep(1)
-                    
+
             except Exception as e:
-                # Catch and log any exceptions within the loop
                 logger.error(f"Error in background task iteration: {str(e)}")
-                # Sleep a bit in case of error to prevent rapid error loops
-                socketio.sleep(1)
-        
-        # If we somehow exit the loop, restart the task to ensure continuous operation
+                socketio.sleep(1) # Sleep after error
+
         logger.warning("Background task completed max iterations, restarting")
         socketio.start_background_task(background_task)
-        
+
     except Exception as e:
-        # Catch and log any exceptions at the top level
         logger.error(f"Fatal error in background task, attempting restart: {str(e)}")
-        # Wait a moment before restarting to prevent rapid restart loops
         socketio.sleep(5)
         socketio.start_background_task(background_task)
 

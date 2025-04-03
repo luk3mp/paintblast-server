@@ -365,106 +365,112 @@ def handle_disconnect():
 def handle_join(data):
     """Handle player join request."""
     server_stats['messages_received'] += 1
-    
+
     player_name = data.get('name', f"Player_{uuid.uuid4().hex[:6]}")
     preferred_team = data.get('team', '').lower()
-    
-    logger.info(f"Join request from {player_name} (SID: {request.sid}) with team preference: {preferred_team}")
-    
+    sid = request.sid  # Store SID outside lock
+
+    logger.info(f"Join request from {player_name} (SID: {sid}) with team preference: {preferred_team}")
+
+    # Variables to store data needed for emits outside the lock
+    join_success_data = None
+    queue_update_data = None
+    should_broadcast_status = False
+    should_broadcast_players = False
+    error_message = None
+    current_players_state = None # To hold players data for broadcast
+    current_server_status = None # To hold server status data for broadcast
+
     try:
         with game_state_lock:
             # Check if player is already in game (possible reconnect)
-            player_already_exists = request.sid in game_state['players']
-            
-            # Check if game has space for the player or if player is already in
-            if player_already_exists or len(game_state['players']) < MAX_PLAYERS:
-                # If player already exists, just update their status
+            player_already_exists = sid in game_state['players']
+            can_join = player_already_exists or len(game_state['players']) < MAX_PLAYERS
+
+            if can_join:
                 if player_already_exists:
-                    player = game_state['players'][request.sid]
+                    player = game_state['players'][sid]
                     logger.info(f"Player {player_name} rejoined as {player['team']}")
-                    
-                    # Send join success to the player who rejoined
-                    socketio.emit('joinSuccess', {
-                        'id': request.sid,
+                    join_success_data = {
+                        'id': sid,
                         'team': player['team'],
                         'position': player['position']
-                    }, room=request.sid)
+                    }
                 else:
                     # New player - assign team
                     team = assign_team(preferred_team)
-                    
-                    # Define base position based on team
                     base_pos = [0, 2, -110] if team == 'red' else [0, 2, 110]
                     spawn_pos = calculate_random_spawn(base_pos)
 
                     player = {
-                        'name': player_name,
-                        'team': team,
-                        'health': 100,
-                        'position': spawn_pos, # Use randomized spawn
-                        'rotation': [0, 0, 0],
-                        'score': 0,
-                        'kills': 0,
-                        'deaths': 0,
-                        'is_eliminated': False, 
-                        'respawn_timer': None,
-                        'joinTime': time.time(),
-                        'lastPosition': None,
-                        'lastRotation': None,
+                        'name': player_name, 'team': team, 'health': 100,
+                        'position': spawn_pos, 'rotation': [0, 0, 0],
+                        'score': 0, 'kills': 0, 'deaths': 0,
+                        'is_eliminated': False, 'respawn_timer': None,
+                        'joinTime': time.time(), 'lastPosition': None, 'lastRotation': None,
                     }
-                    
-                    # Add player to game
-                    game_state['players'][request.sid] = player
+                    game_state['players'][sid] = player
                     logger.info(f"Player {player_name} joined as {team}, total players: {len(game_state['players'])}")
-                    
-                    # Send join success to the player who joined
-                    socketio.emit('joinSuccess', {
-                        'id': request.sid,
+                    join_success_data = {
+                        'id': sid,
                         'team': team,
                         'position': spawn_pos
-                    }, room=request.sid)
-                
-                # Update server status to reflect new player count
-                update_server_status()
-                
-                # Broadcast updated status and player list to ALL clients
-                socketio.emit('serverStatus', server_status)
-                logger.info(f"Broadcasting server status with {server_status['currentPlayers']} players")
-                
-                # Broadcast player list to ALL clients
-                socketio.emit('players', game_state['players'])
-                logger.info(f"Broadcasting player list with {len(game_state['players'])} players")
-                
-            else:
-                # Server is full, add player to queue
+                    }
+
+                # Prepare for broadcast after lock release
+                update_server_status() # Update status while holding lock
+                should_broadcast_status = True
+                should_broadcast_players = True
+                # Make copies of the state needed for broadcasting later
+                current_players_state = game_state['players'].copy()
+                current_server_status = server_status.copy()
+
+
+            else: # Server is full
                 queue_player = {
-                    'sid': request.sid,
-                    'name': player_name,
-                    'preferred_team': preferred_team,
-                    'joinTime': time.time()
+                    'sid': sid, 'name': player_name,
+                    'preferred_team': preferred_team, 'joinTime': time.time()
                 }
-                
-                # Add to queue
                 game_state['queue'].append(queue_player)
-                
-                # Calculate queue position (1-based)
                 position = len(game_state['queue'])
-                
                 logger.info(f"Server full, {player_name} added to queue at position {position}")
-                
-                # Send queue position to player
-                socketio.emit('queueUpdate', {
+
+                queue_update_data = {
                     'position': position,
                     'estimatedWaitTime': estimate_wait_time(position - 1)
-                }, room=request.sid)
-                
-                # Update and broadcast server status
+                }
+                # Update status for queue broadcast
                 update_server_status()
-                socketio.emit('serverStatus', server_status)
+                should_broadcast_status = True # Need to broadcast updated queue length
+                # Make a copy of the status needed for broadcasting later
+                current_server_status = server_status.copy()
+
+
+        # --- Lock is released here ---
+
+        # Perform emits outside the lock
+        if join_success_data:
+            socketio.emit('joinSuccess', join_success_data, room=sid)
+
+        if queue_update_data:
+            socketio.emit('queueUpdate', queue_update_data, room=sid)
+
+        if should_broadcast_status and current_server_status is not None:
+            # Broadcast the status prepared inside the lock
+            socketio.emit('serverStatus', current_server_status)
+            logger.info(f"Broadcasting server status with {current_server_status.get('currentPlayers', 0)} players")
+
+        if should_broadcast_players and current_players_state is not None:
+            # Broadcast the player list prepared inside the lock
+            socketio.emit('players', current_players_state)
+            logger.info(f"Broadcasting player list with {len(current_players_state)} players")
+
     except Exception as e:
         logger.error(f"Error in handle_join: {str(e)}")
-        # In case of error, send error message to client
-        socketio.emit('connectionError', {'message': 'Error joining game'}, room=request.sid)
+        error_message = {'message': 'Error joining game'}
+        # Perform error emit outside lock
+        if error_message:
+             socketio.emit('connectionError', error_message, room=sid)
 
 @socketio.on('message')
 def handle_message(data):

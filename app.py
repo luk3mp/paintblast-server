@@ -370,123 +370,57 @@ def handle_disconnect():
 
 @socketio.on('join')
 def handle_join(data):
-    """Handle player join request."""
+    """Handle player join request. [DEBUG SIMPLIFIED VERSION]"""
     server_stats['messages_received'] += 1
     start_time = time.time()
 
     player_name = data.get('name', f"Player_{uuid.uuid4().hex[:6]}")
-    preferred_team = data.get('team', '').lower()
-    sid = request.sid  # Store SID outside lock
+    # preferred_team = data.get('team', '').lower() # DEBUG: Removed
+    sid = request.sid
 
-    logger.info(f"[handle_join START] SID: {sid}, Name: {player_name}")
+    logger.info(f"[handle_join START - DEBUG] SID: {sid}, Name: {player_name}")
 
-    # Variables to store data needed for emits outside the lock
-    join_success_data = None
-    queue_update_data = None
-    should_broadcast_status = False
-    should_broadcast_players = False
+    join_success = False
     error_message = None
-    current_players_state = None # To hold players data for broadcast
-    current_server_status = None # To hold server status data for broadcast
 
     try:
-        logger.info(f"[handle_join TRY] SID: {sid} - Attempting to acquire lock")
+        logger.info(f"[handle_join TRY - DEBUG] SID: {sid} - Attempting lock")
         with game_state_lock:
-            logger.info(f"[handle_join LOCK ACQUIRED] SID: {sid}")
-            # Check if player is already in game (possible reconnect)
-            player_already_exists = sid in game_state['players']
-            can_join = player_already_exists or len(game_state['players']) < MAX_PLAYERS
-            logger.info(f"[handle_join INSIDE LOCK] SID: {sid} - player_exists={player_already_exists}, can_join={can_join}")
+            logger.info(f"[handle_join LOCK ACQUIRED - DEBUG] SID: {sid}")
+            if sid not in game_state['players']:
+                 # DEBUG: Simplified player object and immediate addition
+                 game_state['players'][sid] = {
+                     'name': player_name,
+                     'team': 'red', # DEBUG: Hardcoded
+                     'position': [0, 2, 0], # DEBUG: Hardcoded
+                     'joinTime': time.time()
+                 }
+                 join_success = True
+                 logger.info(f"[handle_join SUCCESS - DEBUG] SID: {sid} - Player added. Total: {len(game_state['players'])}")
+            else:
+                 logger.info(f"[handle_join ALREADY JOINED - DEBUG] SID: {sid}")
+                 join_success = True # Allow rejoin implicitly for debug
 
-            if can_join:
-                if player_already_exists:
-                    player = game_state['players'][sid]
-                    logger.info(f"[handle_join INSIDE LOCK] SID: {sid} - Player rejoining")
-                    join_success_data = {
-                        'id': sid, 'team': player['team'], 'position': player['position']
-                    }
-                else:
-                    # New player - assign team
-                    logger.info(f"[handle_join INSIDE LOCK] SID: {sid} - Assigning team")
-                    team = assign_team(preferred_team)
-                    logger.info(f"[handle_join INSIDE LOCK] SID: {sid} - Calculating spawn")
-                    base_pos = [0, 2, -110] if team == 'red' else [0, 2, 110]
-                    spawn_pos = calculate_random_spawn(base_pos)
-                    logger.info(f"[handle_join INSIDE LOCK] SID: {sid} - Creating player object")
-                    player = {
-                        'name': player_name, 'team': team, 'health': 100,
-                        'position': spawn_pos, 'rotation': [0, 0, 0],
-                        'score': 0, 'kills': 0, 'deaths': 0,
-                        'is_eliminated': False, 'respawn_timer': None,
-                        'joinTime': time.time(), 'lastPosition': None, 'lastRotation': None,
-                    }
-                    logger.info(f"[handle_join INSIDE LOCK] SID: {sid} - Adding player to game_state")
-                    game_state['players'][sid] = player
-                    logger.info(f"[handle_join INSIDE LOCK] SID: {sid} - Player {player_name} added as {team}, total players now: {len(game_state['players'])}")
-                    join_success_data = {
-                        'id': sid, 'team': team, 'position': spawn_pos
-                    }
+            logger.info(f"[handle_join RELEASING LOCK - DEBUG] SID: {sid}")
+        # --- Lock released ---
+        logger.info(f"[handle_join LOCK RELEASED - DEBUG] SID: {sid}")
 
-                # Prepare for broadcast after lock release
-                logger.info(f"[handle_join INSIDE LOCK] SID: {sid} - Preparing data for broadcast")
-                update_server_status() # Update status while holding lock
-                should_broadcast_status = True
-                should_broadcast_players = True
-                # Make copies of the state needed for broadcasting later
-                current_players_state = game_state['players'].copy()
-                current_server_status = server_status.copy()
-                logger.info(f"[handle_join INSIDE LOCK] SID: {sid} - Prepared {len(current_players_state)} players for broadcast")
-
-            else: # Server is full
-                logger.info(f"[handle_join INSIDE LOCK] SID: {sid} - Server full, adding to queue")
-                queue_player = {
-                    'sid': sid, 'name': player_name,
-                    'preferred_team': preferred_team, 'joinTime': time.time()
-                }
-                game_state['queue'].append(queue_player)
-                position = len(game_state['queue'])
-                logger.info(f"[handle_join INSIDE LOCK] SID: {sid} - Added {player_name} to queue at pos {position}")
-                queue_update_data = {
-                    'position': position, 'estimatedWaitTime': estimate_wait_time(position - 1)
-                }
-                update_server_status()
-                should_broadcast_status = True
-                current_server_status = server_status.copy()
-                logger.info(f"[handle_join INSIDE LOCK] SID: {sid} - Prepared queue status for broadcast")
-
-            logger.info(f"[handle_join RELEASING LOCK] SID: {sid}")
-        # --- Lock is released here ---
-        logger.info(f"[handle_join LOCK RELEASED] SID: {sid} - Performing emits")
-
-        # Perform emits outside the lock
-        if join_success_data:
-            socketio.emit('joinSuccess', join_success_data, room=sid)
-            logger.info(f"[handle_join EMIT] SID: {sid} - Sent joinSuccess")
-
-        if queue_update_data:
-            socketio.emit('queueUpdate', queue_update_data, room=sid)
-            logger.info(f"[handle_join EMIT] SID: {sid} - Sent queueUpdate")
-
-        if should_broadcast_status and current_server_status is not None:
-            socketio.emit('serverStatus', current_server_status)
-            logger.info(f"[handle_join EMIT BROADCAST] SID: {sid} - Sent serverStatus (Players: {current_server_status.get('currentPlayers', 0)})")
-
-        if should_broadcast_players and current_players_state is not None:
-            socketio.emit('players', current_players_state)
-            logger.info(f"[handle_join EMIT BROADCAST] SID: {sid} - Sent players list (Count: {len(current_players_state)})")
+        # DEBUG: No emits in this version
+        if join_success:
+             logger.info(f"[handle_join WOULD EMIT - DEBUG] SID: {sid} - Join was successful.")
+        # else: (No queue handling in debug)
 
     except Exception as e:
-        logger.error(f"[handle_join ERROR] SID: {sid} - Exception: {str(e)}", exc_info=True) # Log traceback
+        logger.error(f"[handle_join ERROR - DEBUG] SID: {sid} - Exception: {str(e)}", exc_info=True)
         error_message = {'message': 'Error joining game'}
 
     finally:
-        # Log completion time regardless of success/error
         end_time = time.time()
-        logger.info(f"[handle_join END] SID: {sid} - Completed in {end_time - start_time:.4f} seconds")
-        # Perform error emit outside lock/try block if needed
+        logger.info(f"[handle_join END - DEBUG] SID: {sid} - Completed in {end_time - start_time:.4f} seconds")
         if error_message:
-             socketio.emit('connectionError', error_message, room=sid)
-             logger.info(f"[handle_join EMIT ERROR] SID: {sid} - Sent connectionError")
+            # Still emit error if one occurred
+            socketio.emit('connectionError', error_message, room=sid)
+            logger.info(f"[handle_join EMIT ERROR - DEBUG] SID: {sid} - Sent connectionError")
 
 @socketio.on('message')
 def handle_message(data):

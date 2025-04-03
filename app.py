@@ -48,7 +48,8 @@ app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'a_very_secret_key
 cors_origins = [
     "http://localhost:3000",  # Local frontend development
     "https://paintblast.vercel.app",  # Vercel deployment URL
-    "https://paintblast.lukemp.co"  # New custom subdomain
+    "https://paintblast.lukemp.co",  # New custom subdomain
+    "https://paintblast-server.onrender.com"  # Render domain for the server itself
     # Add any other origins if needed
 ]
 

@@ -375,7 +375,6 @@ def handle_join(data):
     start_time = time.time()
 
     player_name = data.get('name', f"Player_{uuid.uuid4().hex[:6]}")
-    # preferred_team = data.get('team', '').lower() # DEBUG: Removed
     sid = request.sid
 
     logger.info(f"[handle_join START - DEBUG] SID: {sid}, Name: {player_name}")
@@ -387,28 +386,42 @@ def handle_join(data):
         logger.info(f"[handle_join TRY - DEBUG] SID: {sid} - Attempting lock")
         with game_state_lock:
             logger.info(f"[handle_join LOCK ACQUIRED - DEBUG] SID: {sid}")
+            
+            # DEBUG: Add player with essential info
             if sid not in game_state['players']:
-                 # DEBUG: Simplified player object and immediate addition
-                 game_state['players'][sid] = {
-                     'name': player_name,
-                     'team': 'red', # DEBUG: Hardcoded
-                     'position': [0, 2, 0], # DEBUG: Hardcoded
-                     'joinTime': time.time()
-                 }
-                 join_success = True
-                 logger.info(f"[handle_join SUCCESS - DEBUG] SID: {sid} - Player added. Total: {len(game_state['players'])}")
+                game_state['players'][sid] = {
+                    'name': player_name,
+                    'team': 'red',  # DEBUG: Hardcoded
+                    'position': [0, 2, 0],  # DEBUG: Hardcoded
+                    'health': 100,  # Added essential player state
+                    'kills': 0,
+                    'deaths': 0,
+                    'score': 0,
+                    'joinTime': time.time()
+                }
+                join_success = True
+                logger.info(f"[handle_join SUCCESS - DEBUG] SID: {sid} - Player added. Total players: {len(game_state['players'])}")
+                
+                # Update server status immediately
+                update_server_status()
+                logger.info(f"[handle_join STATUS - DEBUG] Current players: {server_status['currentPlayers']}")
             else:
-                 logger.info(f"[handle_join ALREADY JOINED - DEBUG] SID: {sid}")
-                 join_success = True # Allow rejoin implicitly for debug
+                logger.info(f"[handle_join ALREADY JOINED - DEBUG] SID: {sid}")
+                join_success = True
 
-            logger.info(f"[handle_join RELEASING LOCK - DEBUG] SID: {sid}")
         # --- Lock released ---
         logger.info(f"[handle_join LOCK RELEASED - DEBUG] SID: {sid}")
 
-        # DEBUG: No emits in this version
         if join_success:
-             logger.info(f"[handle_join WOULD EMIT - DEBUG] SID: {sid} - Join was successful.")
-        # else: (No queue handling in debug)
+            # Send essential notifications
+            socketio.emit('joinSuccess', {'team': 'red'}, room=sid)
+            socketio.emit('healthUpdate', {'health': 100}, room=sid)
+            
+            # Broadcast updated player list and status to all clients
+            socketio.emit('players', game_state['players'])
+            socketio.emit('serverStatus', server_status)
+            
+            logger.info(f"[handle_join NOTIFICATIONS SENT - DEBUG] SID: {sid}")
 
     except Exception as e:
         logger.error(f"[handle_join ERROR - DEBUG] SID: {sid} - Exception: {str(e)}", exc_info=True)
@@ -418,7 +431,6 @@ def handle_join(data):
         end_time = time.time()
         logger.info(f"[handle_join END - DEBUG] SID: {sid} - Completed in {end_time - start_time:.4f} seconds")
         if error_message:
-            # Still emit error if one occurred
             socketio.emit('connectionError', error_message, room=sid)
             logger.info(f"[handle_join EMIT ERROR - DEBUG] SID: {sid} - Sent connectionError")
 

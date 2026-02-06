@@ -82,8 +82,8 @@ game_state = {
     'status': 'waiting',
     'scores': {'red': 0, 'blue': 0},
     'flags': {
-        'red': {'captured': False, 'carrier': None, 'position': [0, 0, -110]},
-        'blue': {'captured': False, 'carrier': None, 'position': [0, 0, 110]}
+        'red': {'captured': False, 'carrier': None, 'position': [0, 0, -120]},
+        'blue': {'captured': False, 'carrier': None, 'position': [0, 0, 120]}
     },
     'queue': deque()  # Queue for waiting players, using deque for efficient operations
 }
@@ -110,7 +110,7 @@ PLAYER_RADIUS = 1.0
 PAINTBALL_RADIUS = 0.2
 HIT_DAMAGE = 25
 RESPAWN_TIME = 5  # Seconds for respawn delay
-FLAG_CAPTURE_RADIUS = 4
+FLAG_CAPTURE_RADIUS = 5
 FLAG_SCORE_POINTS = 1
 MIN_PLAYERS_PER_TEAM = 1
 WIN_SCORE = 3
@@ -413,7 +413,7 @@ def handle_join(data):
                 assigned_team = assign_team(preferred_team)
 
                 # Calculate spawn position based on team
-                base_pos = [0, 2, -110] if assigned_team == 'red' else [0, 2, 110]
+                base_pos = [0, 2, -120] if assigned_team == 'red' else [0, 2, 120]
                 spawn_position = calculate_random_spawn(base_pos)
 
                 game_state['players'][sid] = {
@@ -534,6 +534,87 @@ def handle_update_position(data):
             if position_changed:
                 check_flag_interactions(request.sid, player)
 
+@socketio.on('captureFlag')
+def handle_capture_flag(data):
+    """Handle client-reported flag capture as a backup to position-based detection."""
+    server_stats['messages_received'] += 1
+    flag_team = data.get('team', '').lower()  # e.g. 'red' or 'blue'
+    
+    if flag_team not in ('red', 'blue'):
+        return
+    
+    with game_state_lock:
+        if request.sid not in game_state['players']:
+            return
+        player = game_state['players'][request.sid]
+        if player.get('is_eliminated', False):
+            return
+        
+        enemy_flag = game_state['flags'][flag_team]
+        # Only process if the flag isn't already captured
+        if not enemy_flag['captured']:
+            # Validate: player should be on opposite team
+            if player['team'] == flag_team:
+                return  # Can't capture your own flag
+            
+            enemy_flag['captured'] = True
+            enemy_flag['carrier'] = request.sid
+            
+            logger.info(f"[captureFlag event] Player {player['name']} captured the {flag_team} flag!")
+            socketio.emit('flagCaptured', {
+                'team': flag_team,
+                'carrier': player['name']
+            })
+            server_stats['messages_sent'] += 1
+
+@socketio.on('scoreFlag')
+def handle_score_flag(data):
+    """Handle client-reported flag scoring as a backup to position-based detection."""
+    server_stats['messages_received'] += 1
+    flag_team = data.get('team', '').lower()  # Team of the flag being returned
+    
+    if flag_team not in ('red', 'blue'):
+        return
+    
+    with game_state_lock:
+        if request.sid not in game_state['players']:
+            return
+        player = game_state['players'][request.sid]
+        if player.get('is_eliminated', False):
+            return
+        
+        # Validate: this player must be carrying this flag
+        if game_state['flags'][flag_team]['carrier'] != request.sid:
+            return
+        
+        # Reset flag
+        game_state['flags'][flag_team]['captured'] = False
+        game_state['flags'][flag_team]['carrier'] = None
+        
+        # Update score
+        game_state['scores'][player['team']] += FLAG_SCORE_POINTS
+        
+        logger.info(f"[scoreFlag event] Player {player['name']} scored with the {flag_team} flag!")
+        
+        socketio.emit('flagScored', {
+            'team': flag_team,
+            'scorer': player['name'],
+            'redScore': game_state['scores']['red'],
+            'blueScore': game_state['scores']['blue']
+        })
+        server_stats['messages_sent'] += 1
+        
+        # Check win condition
+        if game_state['scores'][player['team']] >= WIN_SCORE:
+            socketio.emit('gameOver', {
+                'winner': player['team'],
+                'redScore': game_state['scores']['red'],
+                'blueScore': game_state['scores']['blue']
+            })
+            server_stats['messages_sent'] += 1
+            game_state['scores']['red'] = 0
+            game_state['scores']['blue'] = 0
+
 @socketio.on('shoot')
 def handle_shoot(data):
     """Handle player shooting."""
@@ -547,13 +628,14 @@ def handle_shoot(data):
             if shooter.get('is_eliminated', False):
                 return
 
-            # Broadcast paintball to all players
-            socketio.emit('paintball', {
+            # Broadcast paintball to all OTHER players (skip sender since they render locally)
+            emit('paintball', {
                 'id': f"pb_{time.time()}_{request.sid}",
                 'origin': data['origin'],
                 'direction': data['direction'],
-                'color': '#ff4500' if shooter['team'] == 'red' else '#0066ff'
-            }, broadcast=True)
+                'color': '#ff4500' if shooter['team'] == 'red' else '#0066ff',
+                'shooter': request.sid
+            }, broadcast=True, include_self=False)
             server_stats['messages_sent'] += 1
 
 @socketio.on('hit')
@@ -622,7 +704,7 @@ def handle_player_elimination(target_id, shooter_id):
     if game_state['flags']['red']['carrier'] == target_id:
         game_state['flags']['red']['captured'] = False
         game_state['flags']['red']['carrier'] = None
-        # The 'position' of the red flag remains its base position [0, 0, -110]
+        # The 'position' of the red flag remains its base position [0, 0, -120]
         flag_dropped = 'red'
         # Emit event to notify clients the flag is back at base
         socketio.emit('flagReturned', {'team': 'red'})
@@ -632,7 +714,7 @@ def handle_player_elimination(target_id, shooter_id):
     if game_state['flags']['blue']['carrier'] == target_id:
         game_state['flags']['blue']['captured'] = False
         game_state['flags']['blue']['carrier'] = None
-        # The 'position' of the blue flag remains its base position [0, 0, 110]
+        # The 'position' of the blue flag remains its base position [0, 0, 120]
         flag_dropped = 'blue'
         # Emit event to notify clients the flag is back at base
         socketio.emit('flagReturned', {'team': 'blue'})
@@ -683,7 +765,7 @@ def respawn_player(player_id):
         # player['respawn_timer'] = None # Clear timer reference if stored
 
         # Calculate new random spawn position
-        base_pos = [0, 2, -110] if player['team'] == 'red' else [0, 2, 110]
+        base_pos = [0, 2, -120] if player['team'] == 'red' else [0, 2, 120]
         player['position'] = calculate_random_spawn(base_pos)
         player['lastPosition'] = None # Reset last known position
         player['lastRotation'] = None # Reset last known rotation
@@ -708,14 +790,15 @@ def check_flag_interactions(player_sid, player):
         return
 
     # Check if player can capture enemy flag
+    # Positions must match the map castles at z=±120
     if player['team'] == 'red':
         flag_team = 'blue'
-        enemy_base = [0, 0, 110]
-        home_base = [0, 0, -110]
+        enemy_base = [0, 0, 120]
+        home_base = [0, 0, -120]
     else:
         flag_team = 'red'
-        enemy_base = [0, 0, -110]
-        home_base = [0, 0, 110]
+        enemy_base = [0, 0, -120]
+        home_base = [0, 0, 120]
     
     # Get player position as vector
     player_pos = player['position']

@@ -80,8 +80,8 @@ game_state_lock = RLock()
 #  CONSTANTS
 # ========================================================================
 
-POSITION_UPDATE_THRESHOLD = 0.5
-ROTATION_UPDATE_THRESHOLD = 0.1
+POSITION_UPDATE_THRESHOLD = 0.1   # Lower threshold for smoother remote movement
+ROTATION_UPDATE_THRESHOLD = 0.05  # Lower threshold for smoother remote aiming
 FLAG_CAPTURE_RADIUS = 5
 FLAG_SCORE_POINTS = 1
 MIN_PLAYERS_PER_TEAM = 1
@@ -539,6 +539,7 @@ def handle_update_position(data):
 
         position = data.get('position')
         rotation = data.get('rotation')
+        is_crouching = data.get('isCrouching', False)
 
         position_changed = False
 
@@ -550,6 +551,9 @@ def handle_update_position(data):
         if rotation and rotation_changed_significantly(rotation, player.get('lastRotation')):
             player['rotation'] = rotation
             player['lastRotation'] = rotation
+
+        # Always update crouch state
+        player['isCrouching'] = is_crouching
 
         if position_changed:
             pending_emits = check_flag_interactions(request.sid, player)
@@ -760,7 +764,7 @@ def health_check():
 def background_task():
     """Periodically broadcast server status and player positions."""
     iteration = 0
-    max_iterations = 86400  # 24 hours at 1s intervals
+    max_iterations = 172800  # 24 hours at 0.5s intervals
 
     try:
         logger.info("Background broadcast task started")
@@ -770,22 +774,27 @@ def background_task():
                 iteration += 1
 
                 with game_state_lock:
-                    update_server_status()
-                    status_copy = server_status.copy()
                     player_count = len(game_state['players'])
 
-                    # Broadcast player positions every 2 seconds
+                    # Always prepare player data if there are players
                     players_data = None
-                    if iteration % 2 == 0 and player_count > 0:
+                    if player_count > 0:
                         players_data = get_players_for_client()
 
-                # Emit outside lock
-                socketio.emit('serverStatus', status_copy)
+                    # Update server status less frequently (every 4 ticks = 2s)
+                    status_copy = None
+                    if iteration % 4 == 0:
+                        update_server_status()
+                        status_copy = server_status.copy()
 
+                # Emit outside lock — players every 500ms for smooth movement
                 if players_data is not None:
                     socketio.emit('players', players_data)
 
-                socketio.sleep(1)
+                if status_copy is not None:
+                    socketio.emit('serverStatus', status_copy)
+
+                socketio.sleep(0.5)
 
             except Exception as e:
                 logger.error(f"Error in background task: {e}")

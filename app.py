@@ -1,6 +1,3 @@
-import eventlet
-eventlet.monkey_patch()
-
 import os
 from flask import Flask, request, jsonify, session
 from flask_socketio import SocketIO, emit, join_room, leave_room
@@ -1041,6 +1038,10 @@ def background_task():
 
 # Run the SocketIO server if executed directly
 if __name__ == '__main__':
+    # Monkey-patch for local dev (gunicorn's eventlet worker does this automatically in production)
+    import eventlet
+    eventlet.monkey_patch()
+
     port = int(os.environ.get('PORT', 8000))
     # Use different debug settings based on environment
     debug_mode = os.environ.get('DEBUG', 'False').lower() == 'true'

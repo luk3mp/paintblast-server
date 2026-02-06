@@ -177,22 +177,25 @@ def broadcast_game_state():
     server_stats['messages_sent'] += 1
 
 def update_server_status():
-    """Update server status information."""
-    with game_state_lock:
-        server_status['currentPlayers'] = len(game_state['players'])
-        server_status['queueLength'] = len(game_state['queue'])
-        
-        # Count players by team
-        red_count = sum(1 for player in game_state['players'].values() if player['team'] == 'red')
-        blue_count = sum(1 for player in game_state['players'].values() if player['team'] == 'blue')
-        
-        server_status['redTeamPlayers'] = red_count
-        server_status['blueTeamPlayers'] = blue_count
+    """Update server status information.
+    NOTE: Must be called while game_state_lock is already held.
+    """
+    server_status['currentPlayers'] = len(game_state['players'])
+    server_status['queueLength'] = len(game_state['queue'])
+    
+    # Count players by team
+    red_count = sum(1 for player in game_state['players'].values() if player['team'] == 'red')
+    blue_count = sum(1 for player in game_state['players'].values() if player['team'] == 'blue')
+    
+    server_status['redTeamPlayers'] = red_count
+    server_status['blueTeamPlayers'] = blue_count
 
 def broadcast_server_status():
     """Broadcast server status to all clients."""
-    update_server_status()
-    socketio.emit('serverStatus', server_status)
+    with game_state_lock:
+        update_server_status()
+        status_copy = server_status.copy()
+    socketio.emit('serverStatus', status_copy)
     server_stats['messages_sent'] += 1
 
 def get_players_for_client():
@@ -312,7 +315,8 @@ def handle_connect():
 
     # Send initial server status to the new client
     try:
-        update_server_status() # Ensure status is current
+        with game_state_lock:
+            update_server_status() # Ensure status is current
         socketio.emit('serverStatus', server_status, room=sid)
         logger.info(f"Sent initial server status to {sid}")
 
@@ -350,6 +354,8 @@ def handle_disconnect():
     """Handle client disconnection."""
     logger.info(f"Client disconnected: {request.sid}")
     
+    pending_emits = []
+    
     with game_state_lock:
         # Check if player was in the game
         if request.sid in game_state['players']:
@@ -361,12 +367,12 @@ def handle_disconnect():
             if game_state['flags']['red']['carrier'] == request.sid:
                 game_state['flags']['red']['captured'] = False
                 game_state['flags']['red']['carrier'] = None
-                socketio.emit('flagReturned', {'team': 'red'})
+                pending_emits.append({'event': 'flagReturned', 'data': {'team': 'red'}})
             
             if game_state['flags']['blue']['carrier'] == request.sid:
                 game_state['flags']['blue']['captured'] = False
                 game_state['flags']['blue']['carrier'] = None
-                socketio.emit('flagReturned', {'team': 'blue'})
+                pending_emits.append({'event': 'flagReturned', 'data': {'team': 'blue'}})
             
             # Process queue to let a waiting player join
             process_queue()
@@ -381,12 +387,17 @@ def handle_disconnect():
                     # Update queue positions
                     update_queue_positions()
                     break
+        
+        # Get player list for broadcast while still holding lock
+        players_for_client = get_players_for_client()
+    
+    # Emit events OUTSIDE the lock
+    for evt in pending_emits:
+        socketio.emit(evt['event'], evt['data'])
     
     # Update and broadcast server status
     broadcast_server_status()
-    # Broadcast player list update with capitalized team names for client
-    with game_state_lock:
-        players_for_client = get_players_for_client()
+    # Broadcast player list update
     socketio.emit('players', players_for_client)
 
 @socketio.on('join')
@@ -502,6 +513,8 @@ def handle_update_position(data):
     server_stats['messages_received'] += 1
     server_stats['position_updates'] += 1
     
+    pending_emits = []
+    
     with game_state_lock:
         if request.sid in game_state['players']:
             player = game_state['players'][request.sid]
@@ -532,7 +545,11 @@ def handle_update_position(data):
             
             # Only check for interactions if position changed
             if position_changed:
-                check_flag_interactions(request.sid, player)
+                pending_emits = check_flag_interactions(request.sid, player)
+    
+    # Emit events OUTSIDE the lock to prevent greenlet blocking
+    for evt in pending_emits:
+        socketio.emit(evt['event'], evt['data'], **evt.get('kwargs', {}))
 
 @socketio.on('captureFlag')
 def handle_capture_flag(data):
@@ -561,11 +578,14 @@ def handle_capture_flag(data):
             enemy_flag['carrier'] = request.sid
             
             logger.info(f"[captureFlag event] Player {player['name']} captured the {flag_team} flag!")
-            socketio.emit('flagCaptured', {
-                'team': flag_team,
-                'carrier': player['name']
-            })
+            capture_emit = {'team': flag_team, 'carrier': player['name']}
             server_stats['messages_sent'] += 1
+        else:
+            capture_emit = None
+    
+    # Emit OUTSIDE the lock
+    if capture_emit:
+        socketio.emit('flagCaptured', capture_emit)
 
 @socketio.on('scoreFlag')
 def handle_score_flag(data):
@@ -575,6 +595,8 @@ def handle_score_flag(data):
     
     if flag_team not in ('red', 'blue'):
         return
+    
+    pending_emits = []
     
     with game_state_lock:
         if request.sid not in game_state['players']:
@@ -596,29 +618,41 @@ def handle_score_flag(data):
         
         logger.info(f"[scoreFlag event] Player {player['name']} scored with the {flag_team} flag!")
         
-        socketio.emit('flagScored', {
-            'team': flag_team,
-            'scorer': player['name'],
-            'redScore': game_state['scores']['red'],
-            'blueScore': game_state['scores']['blue']
+        pending_emits.append({
+            'event': 'flagScored',
+            'data': {
+                'team': flag_team,
+                'scorer': player['name'],
+                'redScore': game_state['scores']['red'],
+                'blueScore': game_state['scores']['blue']
+            }
         })
         server_stats['messages_sent'] += 1
         
         # Check win condition
         if game_state['scores'][player['team']] >= WIN_SCORE:
-            socketio.emit('gameOver', {
-                'winner': player['team'],
-                'redScore': game_state['scores']['red'],
-                'blueScore': game_state['scores']['blue']
+            pending_emits.append({
+                'event': 'gameOver',
+                'data': {
+                    'winner': player['team'],
+                    'redScore': game_state['scores']['red'],
+                    'blueScore': game_state['scores']['blue']
+                }
             })
             server_stats['messages_sent'] += 1
             game_state['scores']['red'] = 0
             game_state['scores']['blue'] = 0
+    
+    # Emit OUTSIDE the lock
+    for evt in pending_emits:
+        socketio.emit(evt['event'], evt['data'])
 
 @socketio.on('shoot')
 def handle_shoot(data):
     """Handle player shooting."""
     server_stats['messages_received'] += 1
+    
+    paintball_data = None
     
     with game_state_lock:
         if request.sid in game_state['players']:
@@ -628,20 +662,25 @@ def handle_shoot(data):
             if shooter.get('is_eliminated', False):
                 return
 
-            # Broadcast paintball to all OTHER players (skip sender since they render locally)
-            emit('paintball', {
+            paintball_data = {
                 'id': f"pb_{time.time()}_{request.sid}",
                 'origin': data['origin'],
                 'direction': data['direction'],
                 'color': '#ff4500' if shooter['team'] == 'red' else '#0066ff',
                 'shooter': request.sid
-            }, broadcast=True, include_self=False)
+            }
             server_stats['messages_sent'] += 1
+    
+    # Emit OUTSIDE the lock
+    if paintball_data:
+        emit('paintball', paintball_data, broadcast=True, include_self=False)
 
 @socketio.on('hit')
 def handle_hit(data):
     """Handle paintball hits."""
     server_stats['messages_received'] += 1
+    
+    pending_emits = []
     
     with game_state_lock:
         target_id = data.get('target')
@@ -664,28 +703,38 @@ def handle_hit(data):
         target['health'] -= HIT_DAMAGE
         logger.info(f"Player {target['name']} hit by {shooter['name']}. Health: {target['health']}")
 
-        # Broadcast health update specifically for the target
-        socketio.emit('healthUpdate', {'health': target['health']}, room=target_id)
+        pending_emits.append({
+            'event': 'healthUpdate',
+            'data': {'health': target['health']},
+            'kwargs': {'room': target_id}
+        })
 
         # Check if player is eliminated
         if target['health'] <= 0:
-            handle_player_elimination(target_id, shooter_id)
-            # No need to broadcast game state here, elimination handles it
-
-        # Optional: Broadcast minimal hit confirmation if needed
-        # socketio.emit('playerHit', {'target': target_id, 'shooter': shooter_id, 'newHealth': target['health']})
+            elim_emits = handle_player_elimination(target_id, shooter_id)
+            pending_emits.extend(elim_emits)
+    
+    # Emit events OUTSIDE the lock
+    for evt in pending_emits:
+        socketio.emit(evt['event'], evt['data'], **evt.get('kwargs', {}))
 
 def handle_player_elimination(target_id, shooter_id):
-    """Handles player elimination, stats, flag drop, and starts respawn timer."""
+    """Handles player elimination, stats, flag drop, and starts respawn timer.
+    
+    Returns a list of events to emit OUTSIDE the lock.
+    Must be called while game_state_lock is held.
+    """
+    pending_emits = []
+    
     if target_id not in game_state['players'] or shooter_id not in game_state['players']:
-        return # Should not happen if called from handle_hit, but safety check
+        return pending_emits
 
     target = game_state['players'][target_id]
     shooter = game_state['players'][shooter_id]
 
     # Prevent double elimination processing
     if target.get('is_eliminated', False):
-        return
+        return pending_emits
 
     logger.info(f"Player {target['name']} eliminated by {shooter['name']}")
 
@@ -696,57 +745,57 @@ def handle_player_elimination(target_id, shooter_id):
     # Update stats
     target['deaths'] += 1
     shooter['kills'] += 1
-    shooter['score'] += 1 # Or adjust scoring logic as needed
+    shooter['score'] += 1
 
     # --- Flag Drop Logic ---
-    flag_dropped = None
-    # Check if target was carrying the RED flag
     if game_state['flags']['red']['carrier'] == target_id:
         game_state['flags']['red']['captured'] = False
         game_state['flags']['red']['carrier'] = None
-        # The 'position' of the red flag remains its base position [0, 0, -120]
-        flag_dropped = 'red'
-        # Emit event to notify clients the flag is back at base
-        socketio.emit('flagReturned', {'team': 'red'})
+        pending_emits.append({'event': 'flagReturned', 'data': {'team': 'red'}})
         logger.info(f"{target['name']} dropped the red flag. It returned to base.")
 
-    # Check if target was carrying the BLUE flag
     if game_state['flags']['blue']['carrier'] == target_id:
         game_state['flags']['blue']['captured'] = False
         game_state['flags']['blue']['carrier'] = None
-        # The 'position' of the blue flag remains its base position [0, 0, 120]
-        flag_dropped = 'blue'
-        # Emit event to notify clients the flag is back at base
-        socketio.emit('flagReturned', {'team': 'blue'})
+        pending_emits.append({'event': 'flagReturned', 'data': {'team': 'blue'}})
         logger.info(f"{target['name']} dropped the blue flag. It returned to base.")
-    # --- End Flag Drop Logic ---
 
-    # Emit kill event announcement to all players
+    # Collect all emit data
     kill_info = {
         'victim': {'id': target_id, 'name': target['name'], 'team': target['team']},
         'killer': {'id': shooter_id, 'name': shooter['name'], 'team': shooter['team']},
         'timestamp': time.time()
     }
-    socketio.emit('playerKilled', kill_info)
+    pending_emits.append({'event': 'playerKilled', 'data': kill_info})
     server_stats['messages_sent'] += 1
 
-    # Send updated stats to the involved players
-    socketio.emit('statsUpdate', {'kills': shooter['kills'], 'score': shooter['score']}, room=shooter_id)
-    socketio.emit('statsUpdate', {'deaths': target['deaths']}, room=target_id)
-
-    # Start respawn timer for the target player
-    socketio.emit('startRespawnTimer', {'duration': RESPAWN_TIME}, room=target_id)
+    pending_emits.append({
+        'event': 'statsUpdate',
+        'data': {'kills': shooter['kills'], 'score': shooter['score']},
+        'kwargs': {'room': shooter_id}
+    })
+    pending_emits.append({
+        'event': 'statsUpdate',
+        'data': {'deaths': target['deaths']},
+        'kwargs': {'room': target_id}
+    })
+    pending_emits.append({
+        'event': 'startRespawnTimer',
+        'data': {'duration': RESPAWN_TIME},
+        'kwargs': {'room': target_id}
+    })
     logger.info(f"Starting {RESPAWN_TIME}s respawn timer for {target['name']}")
 
+    # Schedule respawn using eventlet-compatible timer
     respawn_timer = Timer(RESPAWN_TIME, respawn_player, args=[target_id])
     respawn_timer.start()
-    # target['respawn_timer'] = respawn_timer # Optional: Store timer
 
-    # Broadcast updated game state (will include the reset flag status)
-    broadcast_game_state()
+    return pending_emits
 
 def respawn_player(player_id):
     """Respawns a player after the timer."""
+    pending_emits = []
+    
     with game_state_lock:
         if player_id not in game_state['players']:
             logger.warning(f"Attempted to respawn player {player_id} who is no longer in game.")
@@ -762,7 +811,6 @@ def respawn_player(player_id):
         # Reset player state
         player['health'] = 100
         player['is_eliminated'] = False
-        # player['respawn_timer'] = None # Clear timer reference if stored
 
         # Calculate new random spawn position
         base_pos = [0, 2, -120] if player['team'] == 'red' else [0, 2, 120]
@@ -772,22 +820,29 @@ def respawn_player(player_id):
 
         logger.info(f"Player {player['name']} respawned at {player['position']}")
 
-        # Notify the player they have respawned
+        # Collect emit data while holding lock
         respawn_data = {
             'message': 'You have respawned!',
-            'position': player['position'],
+            'position': list(player['position']),
             'health': player['health']
         }
-        socketio.emit('playerRespawned', respawn_data, room=player_id)
-
-        # Broadcast updated game state (includes new position and status)
-        broadcast_game_state()
+    
+    # Emit OUTSIDE the lock
+    socketio.emit('playerRespawned', respawn_data, room=player_id)
+    broadcast_game_state()
 
 def check_flag_interactions(player_sid, player):
-    """Check and handle player interactions with flags."""
+    """Check and handle player interactions with flags.
+    
+    Returns a list of events to emit OUTSIDE the lock.
+    Each event is a dict: {'event': str, 'data': dict, 'kwargs': dict}
+    Must be called while game_state_lock is held.
+    """
+    pending_emits = []
+    
     # Ignore interactions if player is eliminated
     if player.get('is_eliminated', False):
-        return
+        return pending_emits
 
     # Check if player can capture enemy flag
     # Positions must match the map castles at z=±120
@@ -822,10 +877,9 @@ def check_flag_interactions(player_sid, player):
             
             logger.info(f"Player {player['name']} captured the {flag_team} flag!")
             
-            # Broadcast flag capture
-            socketio.emit('flagCaptured', {
-                'team': flag_team,
-                'carrier': player['name']
+            pending_emits.append({
+                'event': 'flagCaptured',
+                'data': {'team': flag_team, 'carrier': player['name']}
             })
             server_stats['messages_sent'] += 1
     
@@ -849,32 +903,40 @@ def check_flag_interactions(player_sid, player):
             
             logger.info(f"Player {player['name']} scored with the {flag_team} flag!")
             
-            # Broadcast flag score
-            socketio.emit('flagScored', {
-                'team': flag_team,
-                'scorer': player['name'],
-                'redScore': game_state['scores']['red'],
-                'blueScore': game_state['scores']['blue']
+            pending_emits.append({
+                'event': 'flagScored',
+                'data': {
+                    'team': flag_team,
+                    'scorer': player['name'],
+                    'redScore': game_state['scores']['red'],
+                    'blueScore': game_state['scores']['blue']
+                }
             })
             server_stats['messages_sent'] += 1
             
             # Check win condition
             if game_state['scores'][player['team']] >= WIN_SCORE:
-                socketio.emit('gameOver', {
-                    'winner': player['team'],
-                    'redScore': game_state['scores']['red'],
-                    'blueScore': game_state['scores']['blue']
+                pending_emits.append({
+                    'event': 'gameOver',
+                    'data': {
+                        'winner': player['team'],
+                        'redScore': game_state['scores']['red'],
+                        'blueScore': game_state['scores']['blue']
+                    }
                 })
                 server_stats['messages_sent'] += 1
                 
                 # Reset scores for next game
                 game_state['scores']['red'] = 0
                 game_state['scores']['blue'] = 0
+    
+    return pending_emits
 
 @app.route('/status')
 def server_status_endpoint():
     """API endpoint to get server status."""
-    update_server_status()
+    with game_state_lock:
+        update_server_status()
     return jsonify(server_status)
 
 @app.route('/performance')
@@ -901,7 +963,8 @@ def server_performance_endpoint():
 def handle_server_status_request():
     """Handle client request for server status."""
     server_stats['messages_received'] += 1
-    update_server_status()
+    with game_state_lock:
+        update_server_status()
     socketio.emit('serverStatus', server_status, room=request.sid)
     server_stats['messages_sent'] += 1
 

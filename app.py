@@ -764,7 +764,7 @@ def health_check():
 def background_task():
     """Periodically broadcast server status and player positions."""
     iteration = 0
-    max_iterations = 172800  # 24 hours at 0.5s intervals
+    max_iterations = 864000  # 24 hours at 100ms intervals
 
     try:
         logger.info("Background broadcast task started")
@@ -781,20 +781,20 @@ def background_task():
                     if player_count > 0:
                         players_data = get_players_for_client()
 
-                    # Update server status less frequently (every 4 ticks = 2s)
+                    # Update server status less frequently (every 50 ticks = 5s)
                     status_copy = None
-                    if iteration % 4 == 0:
+                    if iteration % 50 == 0:
                         update_server_status()
                         status_copy = server_status.copy()
 
-                # Emit outside lock — players every 500ms for smooth movement
+                # Emit outside lock — players every 100ms (10 ticks/sec)
                 if players_data is not None:
                     socketio.emit('players', players_data)
 
                 if status_copy is not None:
                     socketio.emit('serverStatus', status_copy)
 
-                socketio.sleep(0.5)
+                socketio.sleep(0.1)
 
             except Exception as e:
                 logger.error(f"Error in background task: {e}")

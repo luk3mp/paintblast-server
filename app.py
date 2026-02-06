@@ -35,14 +35,14 @@ cors_origins = [
 # Set up SocketIO — disable verbose logging in production
 is_debug = os.environ.get('DEBUG', 'False').lower() == 'true'
 socketio = SocketIO(
-    app, 
-    cors_allowed_origins=cors_origins, 
+    app,
+    cors_allowed_origins=cors_origins,
     async_mode='eventlet',
     ping_timeout=60,
     ping_interval=25,
     manage_session=False,
-    logger=is_debug,           # Only log in debug mode
-    engineio_logger=is_debug,  # Only log in debug mode
+    logger=is_debug,
+    engineio_logger=is_debug,
     max_http_buffer_size=1e8,
     always_connect=True
 )
@@ -108,12 +108,12 @@ def calculate_random_spawn(base_pos):
 
 def update_server_status():
     """Update server_status dict. Must be called with game_state_lock held."""
-        server_status['currentPlayers'] = len(game_state['players'])
-        server_status['queueLength'] = len(game_state['queue'])
+    server_status['currentPlayers'] = len(game_state['players'])
+    server_status['queueLength'] = len(game_state['queue'])
     red_count = sum(1 for p in game_state['players'].values() if p['team'] == 'red')
     blue_count = sum(1 for p in game_state['players'].values() if p['team'] == 'blue')
-        server_status['redTeamPlayers'] = red_count
-        server_status['blueTeamPlayers'] = blue_count
+    server_status['redTeamPlayers'] = red_count
+    server_status['blueTeamPlayers'] = blue_count
 
 def get_players_for_client():
     """Get player data with capitalized team names for client. Lock must be held."""
@@ -132,16 +132,16 @@ def assign_team(preferred_team=None):
 
     normalized_pref = preferred_team.lower() if preferred_team else None
 
-        if abs(red_count - blue_count) > 1:
-            return 'red' if red_count < blue_count else 'blue'
-        
+    if abs(red_count - blue_count) > 1:
+        return 'red' if red_count < blue_count else 'blue'
+
     if normalized_pref in ['red', 'blue']:
         if normalized_pref == 'red' and red_count <= blue_count:
-                return 'red'
+            return 'red'
         elif normalized_pref == 'blue' and blue_count <= red_count:
-                return 'blue'
-        
-        return 'red' if red_count <= blue_count else 'blue'
+            return 'blue'
+
+    return 'red' if red_count <= blue_count else 'blue'
 
 def position_changed_significantly(new_pos, old_pos):
     if not old_pos:
@@ -149,7 +149,7 @@ def position_changed_significantly(new_pos, old_pos):
     dx = new_pos[0] - old_pos[0]
     dy = new_pos[1] - old_pos[1]
     dz = new_pos[2] - old_pos[2]
-    return (dx*dx + dy*dy + dz*dz) > POSITION_UPDATE_THRESHOLD ** 2
+    return (dx * dx + dy * dy + dz * dz) > POSITION_UPDATE_THRESHOLD ** 2
 
 def rotation_changed_significantly(new_rot, old_rot):
     if not old_rot:
@@ -228,9 +228,9 @@ def check_flag_interactions(player_sid, player):
     if not enemy_flag['captured']:
         flag_pos = enemy_flag['position']
         dist = math.sqrt(
-            (player_pos[0] - flag_pos[0])**2 +
-            (player_pos[1] - flag_pos[1])**2 +
-            (player_pos[2] - flag_pos[2])**2
+            (player_pos[0] - flag_pos[0]) ** 2 +
+            (player_pos[1] - flag_pos[1]) ** 2 +
+            (player_pos[2] - flag_pos[2]) ** 2
         )
         if dist < FLAG_CAPTURE_RADIUS:
             enemy_flag['captured'] = True
@@ -244,9 +244,9 @@ def check_flag_interactions(player_sid, player):
     # Check scoring
     if game_state['flags'][flag_team]['carrier'] == player_sid:
         dist_home = math.sqrt(
-            (player_pos[0] - home_base[0])**2 +
-            (player_pos[1] - home_base[1])**2 +
-            (player_pos[2] - home_base[2])**2
+            (player_pos[0] - home_base[0]) ** 2 +
+            (player_pos[1] - home_base[1]) ** 2 +
+            (player_pos[2] - home_base[2]) ** 2
         )
         if dist_home < FLAG_CAPTURE_RADIUS:
             game_state['flags'][flag_team]['captured'] = False
@@ -397,7 +397,7 @@ def handle_connect():
     # Start background task on first connection
     if first_connect:
         try:
-                 socketio.start_background_task(background_task)
+            socketio.start_background_task(background_task)
             logger.info("Started background broadcast task")
             first_connect = False
         except Exception as e:
@@ -410,7 +410,7 @@ def handle_disconnect():
     logger.info(f"Client disconnected: {sid}")
 
     pending_emits = []
-    
+
     with game_state_lock:
         if sid in game_state['players']:
             player = game_state['players'].pop(sid)
@@ -434,7 +434,7 @@ def handle_disconnect():
                     game_state['queue'].remove(player_in_queue)
                     logger.info(f"Player {player_in_queue['name']} left the queue")
                     break
-    
+
         update_server_status()
         status_copy = server_status.copy()
         players_copy = get_players_for_client()
@@ -458,8 +458,12 @@ def handle_join(data):
     join_success = False
     assigned_team = None
     spawn_position = None
+    join_data = None
+    players_data = None
+    status_data = None
+    queue_pos_data = None
 
-        with game_state_lock:
+    with game_state_lock:
         if sid in game_state['players']:
             # Already in game — just re-confirm (handles reconnection)
             player = game_state['players'][sid]
@@ -473,22 +477,22 @@ def handle_join(data):
             base_pos = [0, 2, -120] if assigned_team == 'red' else [0, 2, 120]
             spawn_position = calculate_random_spawn(base_pos)
 
-                game_state['players'][sid] = {
-                    'name': player_name,
+            game_state['players'][sid] = {
+                'name': player_name,
                 'team': assigned_team,
                 'position': spawn_position,
                 'rotation': [0, 0, 0],
                 'health': 100,
-                    'kills': 0,
-                    'deaths': 0,
-                    'score': 0,
+                'kills': 0,
+                'deaths': 0,
+                'score': 0,
                 'is_eliminated': False,
-                    'joinTime': time.time()
-                }
-                join_success = True
-                update_server_status()
+                'joinTime': time.time()
+            }
+            join_success = True
+            update_server_status()
             logger.info(f"[join] Player {player_name} added to team {assigned_team}. Total: {len(game_state['players'])}")
-            else:
+        else:
             # Server full — add to queue
             game_state['queue'].append({
                 'sid': sid,
@@ -497,7 +501,6 @@ def handle_join(data):
             })
             queue_pos = len(game_state['queue'])
             logger.info(f"[join] Server full. Player {player_name} added to queue at position {queue_pos}")
-            # Will emit queue update below
 
         # Prepare data for emits
         if join_success:
@@ -506,12 +509,15 @@ def handle_join(data):
             players_data = get_players_for_client()
             status_data = server_status.copy()
         else:
-            queue_pos_data = {'position': len(game_state['queue']), 'estimatedWaitTime': len(game_state['queue']) * 30}
+            queue_pos_data = {
+                'position': len(game_state['queue']),
+                'estimatedWaitTime': len(game_state['queue']) * 30
+            }
 
     # Emit outside lock
     if join_success:
         socketio.emit('joinSuccess', join_data, room=sid)
-            socketio.emit('healthUpdate', {'health': 100}, room=sid)
+        socketio.emit('healthUpdate', {'health': 100}, room=sid)
         socketio.emit('players', players_data)
         socketio.emit('serverStatus', status_data)
     else:
@@ -521,31 +527,31 @@ def handle_join(data):
 @socketio.on('updatePosition')
 def handle_update_position(data):
     pending_emits = []
-    
+
     with game_state_lock:
         if request.sid not in game_state['players']:
             return
 
-            player = game_state['players'][request.sid]
+        player = game_state['players'][request.sid]
 
-            if player.get('is_eliminated', False):
-                return
+        if player.get('is_eliminated', False):
+            return
 
-            position = data.get('position')
-            rotation = data.get('rotation')
-            
-            position_changed = False
-            
+        position = data.get('position')
+        rotation = data.get('rotation')
+
+        position_changed = False
+
         if position and position_changed_significantly(position, player.get('lastPosition')):
-                    player['position'] = position
-                    player['lastPosition'] = position
-                    position_changed = True
-            
+            player['position'] = position
+            player['lastPosition'] = position
+            position_changed = True
+
         if rotation and rotation_changed_significantly(rotation, player.get('lastRotation')):
-                    player['rotation'] = rotation
-                    player['lastRotation'] = rotation
-            
-            if position_changed:
+            player['rotation'] = rotation
+            player['lastRotation'] = rotation
+
+        if position_changed:
             pending_emits = check_flag_interactions(request.sid, player)
 
     # Emit outside lock
@@ -556,18 +562,19 @@ def handle_update_position(data):
 @socketio.on('shoot')
 def handle_shoot(data):
     paintball_data = None
-    
+
     with game_state_lock:
         if request.sid not in game_state['players']:
             return
-            shooter = game_state['players'][request.sid]
-            if shooter.get('is_eliminated', False):
-                return
+
+        shooter = game_state['players'][request.sid]
+        if shooter.get('is_eliminated', False):
+            return
 
         paintball_data = {
-                'id': f"pb_{time.time()}_{request.sid}",
-                'origin': data['origin'],
-                'direction': data['direction'],
+            'id': f"pb_{time.time()}_{request.sid}",
+            'origin': data['origin'],
+            'direction': data['direction'],
             'color': '#ff4500' if shooter['team'] == 'red' else '#0066ff',
             'shooter': request.sid
         }
@@ -582,7 +589,7 @@ def handle_hit(data):
     shooter_id = data.get('shooter')
 
     pending_emits = []
-    
+
     with game_state_lock:
         if not target_id or not shooter_id or target_id == shooter_id:
             return
@@ -633,10 +640,10 @@ def handle_capture_flag(data):
         if player.get('is_eliminated', False):
             return
         if player['team'] == flag_team:
-        return
+            return
 
-    enemy_flag = game_state['flags'][flag_team]
-    if not enemy_flag['captured']:
+        enemy_flag = game_state['flags'][flag_team]
+        if not enemy_flag['captured']:
             enemy_flag['captured'] = True
             enemy_flag['carrier'] = request.sid
             logger.info(f"[captureFlag] Player {player['name']} captured {flag_team} flag!")
@@ -663,12 +670,12 @@ def handle_score_flag(data):
         if game_state['flags'][flag_team]['carrier'] != request.sid:
             return
 
-            game_state['flags'][flag_team]['captured'] = False
-            game_state['flags'][flag_team]['carrier'] = None
-            game_state['scores'][player['team']] += FLAG_SCORE_POINTS
-            
+        game_state['flags'][flag_team]['captured'] = False
+        game_state['flags'][flag_team]['carrier'] = None
+        game_state['scores'][player['team']] += FLAG_SCORE_POINTS
+
         logger.info(f"[scoreFlag] Player {player['name']} scored with {flag_team} flag! R{game_state['scores']['red']} B{game_state['scores']['blue']}")
-            
+
         pending_emits.append({
             'event': 'flagScored',
             'data': {
@@ -677,9 +684,9 @@ def handle_score_flag(data):
                 'redScore': game_state['scores']['red'],
                 'blueScore': game_state['scores']['blue']
             }
-            })
-            
-            if game_state['scores'][player['team']] >= WIN_SCORE:
+        })
+
+        if game_state['scores'][player['team']] >= WIN_SCORE:
             pending_emits.append({
                 'event': 'gameOver',
                 'data': {
@@ -687,9 +694,9 @@ def handle_score_flag(data):
                     'redScore': game_state['scores']['red'],
                     'blueScore': game_state['scores']['blue']
                 }
-                })
-                game_state['scores']['red'] = 0
-                game_state['scores']['blue'] = 0
+            })
+            game_state['scores']['red'] = 0
+            game_state['scores']['blue'] = 0
 
     for evt in pending_emits:
         socketio.emit(evt['event'], evt['data'])
@@ -727,7 +734,7 @@ def handle_server_status_request():
 @app.route('/status')
 def server_status_endpoint():
     with game_state_lock:
-    update_server_status()
+        update_server_status()
         return jsonify(server_status.copy())
 
 @app.route('/performance')
@@ -803,9 +810,9 @@ if __name__ == '__main__':
 
     port = int(os.environ.get('PORT', 8000))
     debug_mode = os.environ.get('DEBUG', 'False').lower() == 'true'
-    
+
     logger.info(f"Starting PaintBlast server on port {port}, debug={debug_mode}")
-    
+
     try:
         socketio.run(app, host='0.0.0.0', port=port, debug=debug_mode)
     except Exception as e:

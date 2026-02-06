@@ -1,3 +1,6 @@
+import eventlet
+eventlet.monkey_patch()
+
 import os
 from flask import Flask, request, jsonify, session
 from flask_socketio import SocketIO, emit, join_room, leave_room
@@ -50,8 +53,9 @@ cors_origins = [
     "https://paintblast.vercel.app",  # Vercel deployment URL
     "https://paintblast.luke-mp.co",  # Custom subdomain (updated domain)
     "https://paintblast.lukemp.co",  # Legacy subdomain (keep for backwards compatibility)
-    "https://paintblast-server.onrender.com"  # Render domain for the server itself
-    # Add any other origins if needed
+    "https://paintblast-server.onrender.com",  # Render domain for the server itself
+    "https://paintblast-git-main-luk3mps-projects.vercel.app",  # Vercel preview deployment
+    "https://paintblast-luk3mps-projects.vercel.app",  # Vercel project deployment
 ]
 
 # Set up SocketIO with proper configuration for Gunicorn
